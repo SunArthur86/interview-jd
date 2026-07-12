@@ -205,6 +205,7 @@ const topics = [
   ['Java 架构师如何带团队做 Code Review', '架构设计', ['Code Review', '团队', '质量']],
   ['高潜候选人的系统设计题如何拿高分', '架构设计', ['系统设计', '面试表达', '高分']],
   ['从业务指标反推技术架构的能力模型', '架构设计', ['业务指标', '架构能力', '建模']],
+  ['线上出现频繁死锁告警。你会从哪些 MySQL 信息中拿到证据，定位到底是哪两类 SQL、哪两个事务发生了死锁', 'MySQL', ['MySQL', '死锁', '事务证据链']],
 ];
 
 const groupOf = (subcategory) => {
@@ -691,6 +692,166 @@ const memoryAndInterviewRound = (title, subcategory, tags) => {
 `;
 };
 
+const specialAnswer = (title) => {
+  if (!title.startsWith('线上出现频繁死锁告警')) return '';
+  return `## 专项回答：MySQL 死锁证据链怎么拿
+
+这道题的核心不是背“死锁是互相等待”，而是能在面试现场说清楚：**我从哪里拿证据，证据如何串起来，最后如何定位是哪两个事务、哪两类 SQL、哪两个资源互相等待。**
+
+### 一、先拿第一现场：最近一次死锁详情
+
+第一优先级看 InnoDB 保存的最近一次死锁：
+
+\`\`\`sql
+SHOW ENGINE INNODB STATUS\\G
+\`\`\`
+
+重点看 \`LATEST DETECTED DEADLOCK\` 这段，里面通常能直接看到：
+
+| 证据字段 | 你要读出什么 |
+|----------|--------------|
+| \`TRANSACTION\` | 两个事务的事务 ID、活跃时间、持有锁数量、undo log 条数 |
+| \`WAITING FOR THIS LOCK TO BE GRANTED\` | 当前事务在等哪个表、哪个索引、哪种锁 |
+| \`HOLDS THE LOCK(S)\` | 对方事务已经持有哪些锁 |
+| \`RECORD LOCKS\` | 锁的是记录锁、间隙锁、next-key lock，还是插入意向锁 |
+| \`index\` / \`space id\` / \`page no\` / \`heap no\` | 锁落在哪个索引和物理记录上 |
+| \`WE ROLL BACK TRANSACTION\` | InnoDB 最后选择回滚哪个事务 |
+
+这一步通常能先回答“是哪两个事务互相等”：事务 A 等事务 B 已持有的锁，事务 B 又等事务 A 已持有的锁。
+
+### 二、用 performance_schema 还原锁等待图
+
+如果死锁正在频繁发生，或者想拿结构化证据，我会查 \`performance_schema\`：
+
+\`\`\`sql
+SELECT
+  r.ENGINE_TRANSACTION_ID AS waiting_trx_id,
+  r.THREAD_ID AS waiting_thread_id,
+  r.OBJECT_SCHEMA,
+  r.OBJECT_NAME,
+  r.INDEX_NAME,
+  r.LOCK_TYPE,
+  r.LOCK_MODE,
+  r.LOCK_DATA,
+  b.ENGINE_TRANSACTION_ID AS blocking_trx_id,
+  b.THREAD_ID AS blocking_thread_id,
+  b.LOCK_MODE AS blocking_lock_mode
+FROM performance_schema.data_lock_waits w
+JOIN performance_schema.data_locks r
+  ON w.REQUESTING_ENGINE_LOCK_ID = r.ENGINE_LOCK_ID
+JOIN performance_schema.data_locks b
+  ON w.BLOCKING_ENGINE_LOCK_ID = b.ENGINE_LOCK_ID;
+\`\`\`
+
+这张结果可以把死锁画成一条边：\`waiting_trx_id -> blocking_trx_id\`。如果两条边互相指向，就能证明是事务 A 和事务 B 形成环。
+
+### 三、把事务映射回线程和 SQL 文本
+
+只有事务 ID 不够，面试官会继续问：“到底是哪两类 SQL？”这时要把事务、线程和 SQL 历史串起来：
+
+\`\`\`sql
+SELECT
+  t.THREAD_ID,
+  t.PROCESSLIST_ID,
+  t.PROCESSLIST_USER,
+  t.PROCESSLIST_HOST,
+  t.PROCESSLIST_DB,
+  esh.EVENT_ID,
+  esh.SQL_TEXT,
+  esh.TIMER_WAIT
+FROM performance_schema.threads t
+JOIN performance_schema.events_statements_history_long esh
+  ON t.THREAD_ID = esh.THREAD_ID
+WHERE t.THREAD_ID IN (?, ?)
+ORDER BY t.THREAD_ID, esh.EVENT_ID DESC;
+\`\`\`
+
+然后再看事务历史：
+
+\`\`\`sql
+SELECT
+  THREAD_ID,
+  EVENT_ID,
+  STATE,
+  TIMER_WAIT,
+  ACCESS_MODE,
+  ISOLATION_LEVEL
+FROM performance_schema.events_transactions_history_long
+WHERE THREAD_ID IN (?, ?)
+ORDER BY THREAD_ID, EVENT_ID DESC;
+\`\`\`
+
+这样可以把“事务 A”映射到应用侧的某条更新链路，例如：
+
+- SQL 类型 1：\`UPDATE order SET status = ? WHERE id = ?\`
+- SQL 类型 2：\`UPDATE account_balance SET amount = amount - ? WHERE user_id = ?\`
+
+或者更典型的两类冲突：
+
+- 一类 SQL 先更新订单，再更新账户；
+- 另一类 SQL 先更新账户，再更新订单；
+- 两个事务加锁顺序相反，于是形成循环等待。
+
+### 四、MySQL 5.7 或兼容环境的替代证据
+
+如果环境还在 MySQL 5.7，或者 \`performance_schema.data_locks\` 不完整，可以用：
+
+\`\`\`sql
+SELECT * FROM information_schema.innodb_trx\\G
+SELECT * FROM information_schema.innodb_locks\\G
+SELECT * FROM information_schema.innodb_lock_waits\\G
+SHOW FULL PROCESSLIST;
+\`\`\`
+
+其中：
+
+- \`innodb_trx.trx_id\`：事务 ID；
+- \`trx_mysql_thread_id\`：MySQL 线程 ID；
+- \`trx_query\`：当前正在执行或等待的 SQL；
+- \`innodb_lock_waits\`：谁在等谁；
+- \`SHOW FULL PROCESSLIST\`：连接来源、当前 SQL、执行时间。
+
+### 五、打开全量死锁日志，避免只看到最近一次
+
+\`SHOW ENGINE INNODB STATUS\` 只保留最近一次死锁。如果线上是“频繁死锁告警”，我会临时打开：
+
+\`\`\`sql
+SET GLOBAL innodb_print_all_deadlocks = ON;
+\`\`\`
+
+然后从 MySQL error log 持续收集每一次死锁详情。这样能判断：
+
+- 是不是同一对 SQL 反复死锁；
+- 是否集中在某张表、某个索引、某个业务时间窗口；
+- 是否和最近发布、批任务、补偿任务、营销活动有关。
+
+### 六、从应用侧补齐业务证据
+
+数据库证据能定位锁和 SQL，但要定位“业务链路”，还要补应用证据：
+
+- traceId / requestId：这两个事务分别来自哪个接口；
+- SQL mapper / repository 方法：定位代码入口；
+- 业务参数：订单 ID、用户 ID、SKU ID、租户 ID；
+- 事务边界：\`@Transactional\` 包住了哪些 SQL；
+- 连接池日志：是否有长事务、慢 SQL、连接占用异常；
+- 慢日志与 binlog：确认 SQL 执行频率、顺序和影响行数。
+
+### 七、最终面试回答模板
+
+> 我不会只看一条死锁告警。我会先用 \`SHOW ENGINE INNODB STATUS\\G\` 拿最近一次死锁现场，看两个 \`TRANSACTION\`、等待锁、持有锁、索引名、锁模式和被回滚事务。然后用 \`performance_schema.data_lock_waits\` 和 \`data_locks\` 结构化还原等待图，确认事务 A 等事务 B、事务 B 又等事务 A。接着用 \`threads\`、\`events_statements_history_long\`、\`events_transactions_history_long\` 把事务 ID 映射回线程和 SQL 历史，找出是哪两类 SQL，比如“先更新订单再更新账户”和“先更新账户再更新订单”。如果要长期分析，我会打开 \`innodb_print_all_deadlocks\` 收集 error log，再结合应用 traceId、mapper、业务参数和事务边界，最后给出修复动作：统一加锁顺序、缩短事务、补索引减少范围锁、避免事务里调用外部接口，必要时做队列串行化或乐观锁重试。
+
+### 八、修复方向
+
+- **统一加锁顺序**：所有链路按同一顺序更新表和行，例如先账户后订单。
+- **缩短事务时间**：事务里不做 RPC、IO、复杂计算和大批量循环。
+- **补正确索引**：避免无索引或低选择性索引导致范围锁扩大。
+- **降低隔离级别影响**：确认是否必须 \`REPEATABLE READ\`，评估 \`READ COMMITTED\` 是否可接受。
+- **拆批处理**：大事务拆小批次，降低锁持有时间。
+- **失败重试**：死锁是 InnoDB 正常保护机制，业务侧要能识别 deadlock error 并做幂等重试。
+- **热点串行化**：热点账户、热点库存可通过队列或分片锁做局部串行。
+`;
+};
+
 const body = (index, title, subcategory, tags) => {
   const group = groupOf(subcategory);
   const difficulty = difficultyOf(index);
@@ -698,6 +859,7 @@ const body = (index, title, subcategory, tags) => {
   const primary = tags[0] || subcategory;
   const secondary = tags[1] || '架构';
   const third = tags[2] || '治理';
+  const detailedAnswer = specialAnswer(title);
   return `---
 id: ${id}
 difficulty: ${difficulty}
@@ -788,6 +950,7 @@ memory_points:
 - 能给出可验证指标：P99、错误率、积压量、缓存命中率、GC 停顿、慢 SQL、业务成功率。
 - 能说明线上演进路径：先旁路观测，再灰度放量，最后切主并保留回滚。
 
+${detailedAnswer ? `${detailedAnswer}\n` : ''}\
 ${roundOne(title, subcategory, tags)}
 ${roundTwo(title, subcategory, tags)}
 ${interviewerRound(title, subcategory, tags)}
