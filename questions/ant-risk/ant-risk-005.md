@@ -184,3 +184,60 @@ class UserId {
     public int hashCode() { return Long.hashCode(id); }  // 必须和 equals 一致
 }
 ```
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：风控的特征聚合里你用 HashMap 预聚合 10 万用户的特征，初始容量你设了 262144（2^18）。为什么不直接 new HashMap<>() 让它自己扩容？预估容量的依据是什么？**
+
+因为默认初始容量 16，放 10 万元素会触发约 13 次扩容（16→32→...→131072→262144），每次扩容都是 O(n) 的 rehash——把所有元素重新定位到新桶。13 次扩容累计迁移上百万元素次，在风控的实时聚合链路（每分钟跑一次）里会产生明显的 GC 压力和 STW。预估容量的依据是"目标元素数 / 负载因子 + 1"：100000/0.75 = 133333，HashMap 构造函数会向上取 2 的幂 = 262144，一次到位零扩容。代价是预占 262144 × 4字节（引用）= 1MB 桶数组，对 8G 堆微不足道。
+
+### 第二层：证据与定位
+
+**Q：你怎么证明"默认扩容"真的拖慢了聚合任务？你怎么观测到扩容的代价？**
+
+两组证据：
+1. JFR（Java Flight Recorder）采样——`jcmd <pid> JFR.start duration=60s filename=agg.jfr`，用 JDK Mission Control 打开，看 "Memory Allocation" 里 `java.util.HashMap$Node[]` 的分配大小。如果聚合任务每分钟产生 1G+ 的 HashMap 桶数组分配（16→32→...→262144 各一次），且GC 日志（`-Xlog:gc*`）显示每次扩容后紧跟着一次 Young GC，扩容代价实锤。
+2. arthas trace——`trace com.xxx.FeatureAggregator aggregate '#cost>100'`，看 aggregate 方法内部的耗时，如果 `HashMap.resize` 占了 30%+，直接定位。更细可以用 `trace java.util.HashMap resize` 看 resize 单次耗时（10 万元素一次 resize 约 10-30ms，13 次累计 200ms+）。
+
+### 第三层：根因深挖
+
+**Q：你预估了容量，但线上还是出现 CPU 偶发飙高，jstack 发现卡在 HashMap.get 上。容量已经够大为什么 get 还会慢？**
+
+容量够不代表没冲突。get 慢有两种根因：
+1. 看卡住的栈是否在 `TreeNode.find`——如果桶里是红黑树，说明某个桶链表已经长到 8 转树了。但容量 262144 放 10 万元素，平均每桶 0.4 个元素，转树概率极低。如果真的转树，要查 hashCode 分布——用 arthas ognl 看这个 map 的桶分布：`ognl '@com.xxx.FeatureAggregator@map' -x 1` dump 出来，统计非空桶的链表长度分布。如果某几个桶链长 100+，说明 key 的 hashCode 实现有问题（大量冲突）。
+2. 看 key 的 hashCode 实现——风控的 key 是 UserId（long id），`Long.hashCode(id)` 是 `(int)(id ^ (id>>>32))`，如果 id 是自增的连续值，低位变化但高位不变，在桶下标 `(n-1) & hash`（低位运算）时容易扎堆。根因可能是 hashCode 实现没做好分散。
+
+**Q：根因是 hashCode 实现差导致冲突，那为什么不直接换一个哈希函数？为什么 HashMap 的扰动函数没有解决？**
+
+HashMap 的扰动函数 `(h ^ (h>>>16))` 只把高 16 位异或到低 16 位，对 Long 的 hashCode 来说，它处理的是 `int` 的 32 位，Long 的 hashCode 已经是 `(int)(id ^ (id>>>32))` 把高低位混合过了，但混合后的低位仍然偏向"连续值"。换哈希函数（如用 MurmurHash3 或给 id 乘一个质数再取 hashCode）确实能改善，但 HashMap 的扰动函数设计假设了"用户给的 hashCode 是合理分散的"，它做的是兜底而非根治。更稳妥的做法是在构造 key 时就保证 hashCode 质量——比如用 String key（String 的 hashCode 是 31 倍累加，对数字字符串分散性好），或给 UserId 加一层 hash 散列。
+
+### 第四层：方案权衡
+
+**Q：你换了哈希函数冲突降了，但业务说换 key 结构成本高。有没有不换 key 的方案？为什么不用 TreeMap 或跳表？**
+
+有更轻的方案：换 LinkedHashMap 或调负载因子。但要看根因——如果是少数热点桶冲突（10 万元素里只有 100 个扎堆），换数据结构是过度设计，不如直接给冲突的桶接受 O(k) 查找。TreeMap 是红黑树，所有操作 O(logn)，但要求 key 可比较，且常数比 HashMap 大（每次比较开销 vs 哈希一次），对 10 万元素的平均查找 HashMap 是 O(1) 纳秒级，TreeMap 是 O(logn) 微秒级，整体更慢。跳表（ConcurrentSkipListMap）同理。所以权衡是：如果冲突只在少数桶，接受它（即使转树也是 O(log8)≈3 次比较）；如果全表性冲突（哈希函数系统性差），才考虑换哈希或换结构。
+
+**Q：为什么不直接把 HashMap 换成 ConcurrentHashMap？至少线程安全。**
+
+因为这里是单线程聚合（一个聚合任务线程内用），没有并发访问。换成 CHM 会多 CAS 和 volatile 读的开销（即使无竞争，CHM 的 tabAt 用 Unsafe 的 volatile 语义比 HashMap 的普通数组读慢约 3-5 倍）。用错了工具反而降性能。CHM 的价值在并发场景，单线程场景 HashMap 是最快的。工具选择要先回答"有没有并发"，不能盲目追求"更高级"的容器。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么证明换了哈希函数后冲突真的降了？怎么量化"冲突率"？**
+
+定义并测量"桶链长分布"作为冲突率指标：
+1. 写一个诊断工具——在非生产环境，用真实 10 万 userId 构造 HashMap，然后反射读取 table 数组，统计每个非空桶的链表长度，输出直方图：`[1]: 60000, [2]: 5000, [3-7]: 200, [8+]: 5`。换哈希前如果 [8+] 有 1000 个桶（即 1000 个桶链长超 8），换哈希后降到 <10 个，冲突显著改善。
+2. 线上用 arthas 在低峰期 `ognl '@com.xxx.FeatureAggregator@map' -x 2 --hashCode` 采一次真实 map 的桶分布（注意 ognl 会持锁，必须在低峰），对比桶链长的 P99——从改善前的 P99=8（转树边界）降到改善后的 P99=2。
+3. 同时看 `TreeNode.find` 在火焰图里的占比——改善后应该从 5% 降到 <0.1%。
+
+**Q：怎么让团队所有 HashMap 使用都做好容量预估和 key 设计？**
+
+沉淀成规范和工具：
+1. Code Review 规则——凡是已知元素数的 HashMap（如 `new HashMap<>()` 后立刻循环 put），必须用 `HashMap.newHashMap(expectedSize)`（JDK 19+）或手动算 `(int)(n/0.75)+1` 预估容量；size 未知的小 Map 才允许默认。
+2. 自定义 key 规范——任何做 HashMap key 的自定义类，hashCode 实现必须做单元测试：用 10 万个连续 id 构造 Map，断言最长桶链 < 5。CI 强制跑。
+3. 运行时诊断——给核心 Map 加一个"桶分布"的定期采样（每 10 分钟 dump 一次桶链长直方图上报 Prometheus），`hashmap_max_bucket_depth` 指标告警阈值 8。
+4. 故障复盘——把这次"Long.hashCode 连续 id 冲突 → get 慢 → CPU 飙高"的桶分布直方图和 jstack 截图存知识库，作为"key 设计要考虑 hashCode 分布"的案例。

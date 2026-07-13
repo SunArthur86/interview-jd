@@ -267,3 +267,66 @@ server_id=2
 CHANGE MASTER TO MASTER_AUTO_POSITION=1;
 START SLAVE;
 ```
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：风控事件库你用 Canal 订阅 binlog 做 CDC（同步到 ES + Kafka），而不是用业务代码"双写"（写 MySQL 同时发 Kafka）。为什么？决策依据是什么？**
+
+双写的核心问题是"一致性 + 性能"。一致性上，双写要靠分布式事务（XA 或 TCC），否则"写 MySQL 成功但发 Kafka 失败"时数据不一致，且 Kafka 失败时是重试还是回滚 MySQL 逻辑复杂。性能上，双写让写路径变长（MySQL + Kafka 都成功才返回），RT 增加。Canal 订阅 binlog 是"单写 + 异步派生"——业务只写 MySQL（单机事务，强一致），Canal 异步订阅 binlog 派生到 ES/Kafka，最终一致。写路径快、一致性有保障（binlog 是 MySQL 事务的一部分，只要 MySQL 写成功 binlog 就在）。代价是延迟（Canal 订阅 + Kafka 投递有秒级延迟）和"非实时"（ES 数据滞后于 MySQL）。决策依据是 SLA——风控事件写入要求强一致 + 低延迟（用户支付时写流水），派生数据（ES/Kafka）可接受秒级延迟。所以主链路单写 MySQL，派生链路 Canal 异步。
+
+### 第二层：证据与定位
+
+**Q：业务反馈"ES 里的风控事件比 MySQL 慢 5 分钟"，怀疑 Canal 延迟。你怎么确认是 Canal 慢还是下游 Kafka/ES 慢？**
+
+沿数据流逐段定位（MySQL → Canal → Kafka → ES）：
+1. MySQL 到 Canal——对比 MySQL 的 binlog 位点（`SHOW MASTER STATUS` 的 position/file）和 Canal 记录的已消费位点（Canal 的 `canal.instance.master.position`，在 ZK 或内存）。如果差值大（位点差几万），是 Canal 消费跟不上（Canal 解析慢或网络）。看 Canal 的 `canal.instance.network.receiveBufferSize` 和解析延迟指标。
+2. Canal 到 Kafka——看 Canal 的 `canal.mq.produce.latency`（投递 Kafka 的延迟）和 Kafka 的 `consumer_lag`（Kafka 消费者 lag）。如果 Canal 投递正常但 Kafka lag 大，是下游消费者（ES 同步 job）慢。
+3. Kafka 到 ES——看 ES 同步 job 的处理速率（每秒消费多少条）。如果消费速率 < 生产速率，是 ES 写入慢（如 ES 的 refresh interval 太短导致频繁 segment merge，或 ES 集群负载高）。用 `curl es:9200/_cat/segments` 看 segment 数量。
+真实案例常见是第 3 种——ES 的 refresh_interval=1s（默认）导致每秒 refresh 一次，大批量写入时 merge 跟不上，消费速率掉到几十/秒。调大 refresh_interval 到 30s，写入速率恢复。
+
+### 第三层：根因深挖
+
+**Q：你发现是 Canal 本身慢（位点差几万），Canal 解析 binlog 的吞吐跟不上主库写入。根因是什么？**
+
+Canal 慢几种根因：
+1. binlog 格式问题——如果 binlog 是 ROW 格式且表很宽（100 列），每行变更的 binlog 体积大，Canal 解析（反序列化）慢。看 Canal 的 `canal.instance.parser.binlog.byte.per.second`，如果吞吐 < 10MB/s 且 CPU 高，是解析瓶颈。
+2. 单线程解析——Canal 默认单线程解析 binlog（一个 parser 线程），如果主库写入 QPS 极高（如每秒 10 万次写），单线程解析跟不上。看 Canal 的 parser 线程 CPU（如果打满 100%，是单核瓶颈）。
+3. 投递 Kafka 慢——Canal 投递 Kafka 如果是同步发（等 ACK），每次投递一个 RTT，吞吐受限。看 Canal 的 `canal.mq.produce.latency`，如果每条投递 >10ms，是 Kafka 投递瓶颈。
+真实案例常见是第 3 种——Canal 的 Kafka 投递是同步模式（`canal.mq.transaction=true`），每条 binlog 事件等 Kafka ACK，RT 1-3ms，吞吐被限制在 300-1000 TPS。改成异步批量投递（`canal.mq.batch.size=1000` + `canal.mq.async=true`），吞吐提升 10 倍。
+
+**Q：根因是 Canal 投递 Kafka 同步模式慢。那为什么不直接绕过 Canal，用 Debezium 或 Maxwell 做 CDC？它们可能更快。**
+
+Debezium 基于 Kafka Connect，吞吐和可靠性确实好，但有取舍。Debezium 的部署更重（要 Kafka Connect 集群），且它的 schema registry + Avro 序列化对消费端有要求（要解 Avro），而 Canal 的消费端是简单 JSON，对接成本低。Maxwell 轻量但功能弱（不支持 DDL 同步、高可用弱）。Canal 的优势是阿里系生态成熟、支持本地 HA（Canal HA 集群）、和 Kafka/RocketMQ/MQ 对接完善。风控选 Canal 是因为生态熟悉 + 功能满足。根因（同步投递）是配置问题不是工具问题，调配置（异步批量）即可解决，不值得换工具。换工具的迁移成本（重新适配消费端、验证数据一致性）远高于调配置。只有当 Canal 的架构瓶颈（如单线程解析）无法通过配置解决，且吞吐确实不够时，才考虑换。
+
+### 第四层：方案权衡
+
+**Q：你把 Canal 改成异步批量投递，吞吐上去了，但业务说"偶尔会丢数据"（ES 里少了几条事件）。根因是什么？异步模式的数据可靠性怎么权衡？**
+
+异步批量投递的丢数据风险在于"Canal 进程挂了时，内存里未投递的消息丢失"。同步模式（每条等 ACK）不丢（ACK 了才推进位点），但慢；异步批量（内存攒一批再发）快，但挂了内存里的批次丢失。权衡方案是"批量 + 同步位点"——批量投递提升吞吐，但每批投递成功后才推进 Canal 的消费位点（持久化到 ZK/文件）。这样 Canal 挂了重启后，从最后 ACK 的位点重新消费，未投递成功的批次重发（at-least-once）。代价是"可能重复"（已投递但位点未更新的批次重发），需要消费端幂等。风控事件的消费端（ES 同步）用事件 ID 做 `_id`（ES 的 upsert 天然幂等），所以重复投递无副作用。权衡点是"用消费端幂等换生产端吞吐"，这对风控事件（写入是 INSERT，ID 唯一）可行；对非幂等场景（如计数累加）要更复杂的去重。
+
+**Q：为什么不直接用 MySQL 的组复制（MGR）或半同步复制替代 Canal？MGR 强一致不丢数据， Canal 还要处理 at-least-once。**
+
+因为 MGR 和 Canal 解决的是不同问题。MGR 是"MySQL 之间的多副本同步"（主库写到其他 MySQL 从库），解决的是 MySQL 高可用 + 强一致。Canal 是"MySQL 到异构系统（ES/Kafka/Redis）的派生"，解决的是数据流转。我们要的是"风控事件写入 MySQL 后，同步到 ES 做多维查询 + Kafka 做实时计算"，ES 和 Kafka 不是 MySQL，MGR 同步不过去。MGR 只能 MySQL 到 MySQL。要用 MGR 实现 ES 同步，还得在 MySQL 从库上再起一个 Canal 订阅，绕了一圈还是要 Canal。所以正确架构是 MGR（MySQL 高可用）+ Canal（异构派生），两者职责不同。Canal 的 at-least-once + 幂等是异构同步的通用代价，不是 Canal 的缺陷。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么验证 Canal 的 CDC 链路可靠——不丢数据、延迟可控？怎么量化"CDC 健康度"？**
+
+三个核心指标：
+1. 端到端延迟——在 MySQL 写入时打时间戳（如事件的 created_at），ES 同步后对比 `now - created_at`，上报 `cdc.latency` 指标。P99 应 <30 秒（Canal 订阅 + Kafka + ES 写入的累计延迟）。延迟 >1 分钟告警。
+2. 数据完整性——每天跑对账任务，对比 MySQL 和 ES 的当日事件数（`SELECT COUNT(*) FROM risk_event WHERE date=today` vs `curl es:9200/risk_event/_count?q=date:today`），差异率应 <0.01%（允许 Canal 重启期间极小丢失）。差异 >0.1% 告警。
+3. 位点健康——监控 Canal 的消费位点 vs 主库 binlog 位点的差值（`binlog.lag.bytes`），差值持续不增长说明 Canal 跟得上，差值单调增长说明消费跟不上（要扩容或优化）。
+
+**Q：怎么让团队的 CDC 链路稳定、不丢数据？**
+
+沉淀成规范和机制：
+1. CDC 统一收口——所有"MySQL 到异构系统"的同步走统一的 Canal 平台（不允许各团队自己起 Canal 实例），平台统一管理位点、监控、HA。
+2. 幂等强制——所有 CDC 消费端必须幂等（用业务唯一键去重），CI 校验。Canal 的 at-least-once 语义要求消费端必须容忍重复。
+3. 位点持久化——Canal 的位点必须持久化到 ZK/文件，不能只在内存。重启后从持久化位点恢复。定期备份位点。
+4. 延迟监控——Canal 的 binlog lag、Kafka consumer lag、ES 同步 job 的处理速率，全链路监控，任何一段积压告警。
+5. 对账常态化——每天自动跑 MySQL vs ES/Kafka 的对账，差异告警 + 自动修复（从 MySQL 重灌差异部分）。
+6. 故障复盘——把这次"Canal 同步投递慢 → ES 延迟 5 分钟"的位点曲线、投递配置、异步批量方案存知识库，作为"CDC 要异步批量 + 幂等消费"的案例。

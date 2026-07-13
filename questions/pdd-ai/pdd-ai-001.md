@@ -127,3 +127,49 @@ public void onConfig(PoolConfig cfg) {
 1. **核心线程能预热吗**？——`prestartAllCoreThreads()` 提前创建，避免冷启动延迟。
 2. **线程池怎么传 MDC/TraceId**？——用装饰器（`TaskDecorator`）在 submit 时拷贝上下文。
 3. **线程池和 ForkJoin/CompletableFuture 区别**？——线程池适合独立任务；FJ 适合分治任务；CF 是异步编排（底层默认 ForkJoinPool）。
+
+## 苏格拉底式面试追问
+
+> 这组追问不背答案，模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：你们 AI 中台的在线推理线程池为什么把核心线程数设到 64 而不是按 CPU 核数 N+1 来配？这样配不怕线程过多抢 CPU 吗？**
+
+因为在线推理的线程主要在做"等 GPU"——请求通过 gRPC 打给 Triton/vLLM，线程 99% 时间阻塞在 `Future.get()` 上，真正占 CPU 的计算极少。这是典型的 IO 密集场景，按 N+1 配（比如 32 核机器给 33 线程）会让 GPU 大量时间闲置在"没有请求可拼 batch"。64 是按 GPU 卡数 × 每卡期望并发 batch 算的：8 卡 × 8 并发 = 64，保证 vLLM 的 Continuous Batching 队列始终有请求可攒。CPU 抢占不严重，因为线程都在 park，`pool_active_ratio` 实测只有 15% 左右。
+
+### 第二层：证据与定位
+
+**Q：你说线程都在等 GPU，怎么证明不是 CPU 成了瓶颈？线上 P99 飙到 2 秒，你怎么排除线程池的问题？**
+
+看三组指标交叉验证。第一，`jstack <pid> | grep -A1 "llm-online" | awk '{print $1}' | sort | uniq -c`——看线程状态分布，如果 80% 以上是 WAITING/TIMED_WAITING（park 在 `Future.get` 上），说明不是 CPU 跑满了，是在等下游。第二，看 `pool_active_ratio`（活跃线程/最大线程）和 `queue_wait_ms_p99`（任务从入队到开始执行的 P99 等待），如果 active_ratio 才 20% 但 queue_wait_ms_p99 已经 800ms，说明不是线程不够，是下游 GPU 慢导致线程被占用。第三，看 `rejected_tasks` 计数，如果没触发拒绝策略（CallerRunsPolicy），说明队列没满，瓶颈不在线程池容量，要往下查 Triton 那边的 `inference_queue_size` 和 `batch_latency_p99`。
+
+### 第三层：根因深挖
+
+**Q：假设你定位到是 `queue_wait_ms_p99` 持续 500ms，但 GPU 利用率才 40%，队列却堆了 1800 个任务。这是什么原因？不是 GPU 不够忙吗？**
+
+这是典型的"GPU 在等 batch 攒够"和"线程池在等 GPU 返回"的双向等待。vLLM 的 Continuous Batching 有个 `max_num_batched_tokens`（比如 8192）和 `max_num_seqs`（比如 256），当队列里都是长 prompt 请求（比如 4000 token），一个请求就快占满一个 batch 的 token 预算，导致 vLLM 一次只能处理 2 个请求，剩下 1800 个在队列里等。GPU 利用率 40% 是因为 batch 没攒满（算力没吃满），不是 GPU 空闲。根因是请求长度分布不均——长 prompt 把 batch 槽位撑爆了。
+
+**Q：那为什么不直接把线程池核心数从 64 调到 256？队列里任务多，加线程不就能更快消化？**
+
+加线程没用，因为瓶颈不在"线程数不够"，而在"下游 batch 容量不够"。线程加到 256 只会让更多线程同时 park 在 vLLM 的 gRPC 调用上，vLLM 那边的队列只会更长，`queue_wait_ms_p99` 反而上升（队列先进先出，排得更长）。治本是在 vLLM 侧调 `max_num_batched_tokens`（8192→16384）或开启 Chunked Prefill（把长 prompt 切块和 Decode 交错），让 GPU 能同时处理更多请求。线程池这边反而该减——长 prompt 场景下线程数 64 够了，多了是浪费。
+
+### 第四层：方案权衡
+
+**Q：你把 max_num_batched_tokens 调到 16384，GPU 利用率上去了，但 TTFT（首 token 延迟）从 500ms 飙到 1.5 秒。业务说客服场景首 token 必须快，你怎么权衡？**
+
+这是吞吐和延迟的经典权衡。`max_num_batched_tokens` 调大让更多请求拼 batch，吞吐上去了，但每个请求要等 batch 攒满才开算，TTFT 就升了。解法是分层：第一，按请求类型分池——客服对话（短 prompt、要快）走 `online-fast` 池，配小 batch（4096）+ 高优先级；长文档摘要（长 prompt、可慢）走 `offline` 池，配大 batch（16384）+ 低优先级。第二，在 vLLM 侧用优先级队列（vLLM 0.6+ 支持），客服请求优先调度。第三，对客服请求开 Prefix Caching（system prompt 固定，KV 命中后 TTFT 能降到 200ms 以内）。
+
+**Q：为什么不直接给客服场景独占 GPU 集群？资源隔离不是更彻底吗？**
+
+独占集群是过度隔离。客服 QPS 白天高夜里低，独占意味着夜里 GPU 利用率 5%，而 GPU 是按小时计费的（H100 30+/小时），成本扛不住。分池 + 优先级队列能在同一集群内实现"软隔离"——客服请求优先调度，长任务填空，整体 GPU 利用率 80%+。只有当客服 SLO 被长任务反复挤兑且调参无效时，才考虑物理隔离（比如客服独占 2 台 H100 机器，其余共享）。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么证明这次线程池 + vLLM 参数调整真的有效，而不是大促前流量本来就低？**
+
+上线前采 1 周基线：`queue_wait_ms_p99`、`rejected_tasks`、`model_latency_p95`、`ttft_p95`、GPU 利用率，按小时分桶存。上线后同样采 1 周。做两个对比：第一，时间对比——取上线前后同一时段（比如工作日 10-12 点高峰）的指标对比，消除昼夜波动。第二，流量归一化——把 `queue_wait_ms_p99` 除以 QPS（wait/QPS），如果上线后 wait/QPS 显著下降且 GPU 利用率上升，证明是参数效果不是流量因素。第三，A/B 实验——网关按 uid 哈希分 50% 走新参数、50% 走旧参数，同时段对比，最严谨。
+
+**Q：怎么让团队以后不踩同样的坑？**
+
+沉淀三件事。第一，线程池配置进配置中心（Nacos），core/max/queue 容量可热更新，不用发版；每次变更记录 before/after 指标到 wiki。第二，加监控告警——`queue_wait_ms_p99 > 1000ms` 持续 3 分钟告警，`rejected_tasks/min > 0` 告警，`pool_active_ratio > 80%` 告警（说明线程不够或下游慢）。第三，把"线程池参数要和 vLLM 的 batch 参数联动调"写进团队的 LLM 上线 checklist——单独调线程池不看下游 batch 容量是常见误区。

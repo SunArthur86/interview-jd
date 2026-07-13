@@ -134,3 +134,72 @@ orderStream.assignTimestampsAndWatermarks(watermarkStrategy)
 1. **Flink exactly-once 怎么保证**？——Checkpoint（barrier 对齐）+ 幂等 sink（如 MySQL upsert）。
 2. **Watermark 作用**？——处理乱序，Watermark = 最大事件时间 - 延迟容忍，晚于 Watermark 的丢弃。
 3. **Flink vs Spark Streaming**？——Flink 真流（毫秒）、Spark 微批（秒）；Flink 状态管理强，Spark 生态全。
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：供应链的实时 GMV 大盘，你用 Flink 而不是每小时跑一个离线 Spark 任务聚合。Flink 的成本（要维护状态后端、Checkpoint）值在哪？**
+
+值在"决策时效"。供应链大促时，销量异动要在分钟级发现（某类目突然爆单要紧急补货），离线 Spark 每小时跑一次，发现问题已是 1 小时后，错过补货窗口。Flink 的实时聚合让大盘每秒更新，运营能在 5 分钟内响应。成本是确实要维护 Flink 集群（如 20 台机器）+ HDFS Checkpoint 存储，但相比"补货不及时导致的缺货损失"，ROI 划算。只有实时性要求低的场景（如 T+1 报表）才用离线。
+
+### 第二层：证据与定位
+
+**Q：实时 GMV 大盘突然归零（昨天还有数据）。你怎么定位是 Flink 任务挂了、Kafka 没数据，还是 Sink 写不进去？**
+
+三段排查：
+1. **Flink 任务状态**——Flink WebUI 看 job 状态，如果 `FAILED` 或 `RESTARTING`，任务挂了（看异常日志，常见是 OOM 或 Checkpoint 超时）。看 `numRecordsIn` 指标，如果 = 0，说明没消费数据。
+2. **Kafka 数据源**——`kafka-console-consumer --topic order-events --from-beginning | tail`，看是否有新消息。`consumer_lag` 如果 > 0 说明 Kafka 有数据但 Flink 消费不动（反压或卡住）。
+3. **Sink 写入**——看 `numRecordsOut`，如果 in 有数据但 out = 0，是 Sink 端写不进去（如大盘的 Redis/MySQL 连接满了）。看 Sink 算子的 `backPressure` 指标，如果高，是下游写慢导致反压。
+
+### 第三层：根因深挖
+
+**Q：Flink 任务每 10 分钟重启一次，日志显示 Checkpoint 超时（checkpoint expired before completing）。根因是什么？**
+
+根因是 Checkpoint 做不完，常见三个原因：
+1. **状态太大**——百万 SKU 的窗口状态（如近 1 小时销量）在 RocksDB 里涨到几十 GB，每次 Checkpoint 要把全量状态写到 HDFS，60s 内做不完。解法是开**增量 Checkpoint**（RocksDBStateBackend 支持，只传增量的 SST 文件）。
+2. **反压**——下游 Sink 写得慢，barrier 随数据流被反压阻塞，barrier 对齐耗时。看 WebUI 的 `backPressure`，如果有算子 > 50%，就是反压。解法是优化 Sink（批量写、加并发）或加`setMinPauseBetweenCheckpoints`。
+3. **对齐等待**——多上游算子 barrier 到达时间差大，等齐耗尽超时。改用 `AT_LEAST_ONCE`（不对齐，牺牲 exactly-once）或 `unalignedCheckpoint`（非对齐 Checkpoint，Flink 1.11+）。
+定位：看 WebUI Checkpoint 的 `Duration` 详情，哪个算子的 `align` 时间长就是瓶颈。
+
+**Q：那为什么不直接把 Checkpoint 间隔调大（从 60s 调到 5 分钟），让它有更多时间做完？**
+
+调大间隔治标不治本，且有害：
+1. **故障恢复丢更多数据**——Checkpoint 间隔越大，恢复时回退的数据越多。60s 间隔最多丢 1 分钟数据，5 分钟间隔丢 5 分钟，大促时 5 分钟的订单数据丢失不可接受。
+2. **掩盖根因**——状态膨胀或反压是设计问题，调大间隔只是延缓 Checkpoint 失败，状态继续涨最终还是会超时。
+3. **背压不解决**——下游写慢是 Sink 性能问题，调大 Checkpoint 不会让 Sink 变快。
+正确做法是定位根因（增量 Checkpoint、优化 Sink、消除反压），间隔保持 60s-2min。
+
+### 第四层：方案权衡
+
+**Q：实时库存预警，库存低于阈值要报警。你用 Flink 监听库存变更事件触发预警，但库存变更频繁（每秒上万次），Flink 会不会成为瓶颈？**
+
+会。每条库存变更都过 Flink 是过度设计——大多数库存变更是正常的（从 1000 扣到 999），不需要预警。优化方案：
+1. **Flink 只处理异常**——把库存判断前置到 Redis Lua（扣减时如果 `stock < threshold` 就发预警事件到 Kafka），Flink 只消费预警事件（量级从 10 万/秒降到 100/秒），大幅减负。
+2. **阈值状态用 Flink**——如果阈值是动态的（如"近 7 天日均销量的 20%"），Flink 维护滚动窗口算日均，定时（每 5 分钟）把"SKU→阈值"写回 Redis，Lua 扣减时读 Redis 阈值判断。Flink 做聚合，Redis 做实时判断，分工。
+
+**Q：为什么不直接用 MySQL 触发器或定时任务查库存做预警，而要引入 Flink？**
+
+MySQL 方案的三个问题：
+1. **定时任务延迟高**——每 5 分钟扫一次 `SELECT * FROM stock WHERE qty < threshold`，千万 SKU 全表扫慢，且 5 分钟延迟内可能已经超卖。
+2. **触发器影响写入**——MySQL 触发器在每次 UPDATE 时执行，大促写入 QPS 高，触发器拖慢扣减。
+3. **阈值动态计算难**——"近 7 天日均销量的 20%"要跨天聚合，MySQL 做窗口聚合性能差。
+Flink 的优势是流式增量计算 + 状态管理，适合"基于历史数据算动态阈值"。但简单场景（固定阈值 + 不要求秒级）用 Redis Lua 扣减时判断就够，不一定非要 Flink。按场景选工具。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么证明 Flink 的 exactly-once 真的生效、故障恢复后数据不丢不重？**
+
+两个验证：
+1. **故障注入测试**——手动 kill Flink TaskManager，让任务从 Checkpoint 恢复。恢复后对比"恢复点的 GMV 值"和"业务侧对账值"（`SELECT SUM(amount) FROM orders WHERE create_time < 恢复时刻`），两者相等证明没丢没重。
+2. **幂等 Sink 验证**——Sink 用 MySQL upsert（`INSERT ... ON DUPLICATE KEY UPDATE`），即使 Flink 重放同一批数据，upsert 保证结果幂等。监控 `flink_records_sent - mysql_rows_affected` 的差值，正常 = 0（重放不影响最终值）。
+
+**Q：怎么让团队写 Flink 任务时不踩"状态膨胀 / 反压 / Checkpoint 失败"的坑？**
+
+沉淀规范：
+1. **Flink 任务模板**——封装好 Checkpoint 配置（60s 间隔、RocksDB 增量、unaligned）、Watermark 策略、Metric 上报，业务方只写算子逻辑。
+2. **状态大小告警**——`flink_state_size` 指标接 Prometheus，单任务状态 > 50GB 告警，review 是否该清理（设 TTL `StateTtlConfig` 让过期状态自动清理）。
+3. **反压巡检**——每天扫描所有 job 的 `backPressure` 指标，> 50% 的任务自动建工单优化 Sink（批量写、加并发、拆分算子）。
+

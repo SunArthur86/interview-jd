@@ -387,3 +387,49 @@ Agent：
 1. **Agent 编排和工作流引擎区别**？——工作流是固定 DAG（人预设），Agent 是动态决策（LLM 推理）；工作流可控，Agent 灵活但难控，可混合（工作流框架 + Agent 决策点）。
 2. **多 Agent 怎么避免冲突**？——明确分工 + 共享状态 + Supervisor 仲裁 + 消息协议。
 3. **怎么评估 Agent 效果**？——任务完成率 + 工具调用准确率 + 成本（token）+ 用户满意度，自动化测试集（已知答案任务）+ 在线 A/B。
+
+## 苏格拉底式面试追问
+
+> 这组追问不背答案，模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：你说用 LangGraph 做多 Agent 编排。但拼多多已有的 Airflow/DAG 工作流引擎也能做任务编排（定义节点、依赖、条件分支），为什么还要引入 LangGraph？Airflow 不是更稳定成熟吗？**
+
+Airflow 和 LangGraph 的本质区别是"任务编排"vs"决策编排"。第一，Airflow 的 DAG 是人预设的固定流程（节点 A → 节点 B → 条件分支 C 或 D），每个节点的执行逻辑是确定的代码，适合"数据 ETL、定时任务"这种流程固定的场景。第二，Agent 编排需要"动态决策"——LLM 根据上一步结果决定下一步做什么，比如 Researcher 查到"GMV 跌幅 15%"后，Planner 要动态决定"是查实验还是查用户画像"，这个决策是 LLM 实时推理的，不是预设的 if-else。第三，LangGraph 的 `StateGraph` 支持"循环"（Critic 不满意可以让 Worker 重做），Airflow 的 DAG 是有向无环图（不能循环）。第四，LangGraph 的节点是 LLM + Tools，Airflow 的节点是 Python 函数。混用方案：流程固定的部分（数据准备、报告分发）用 Airflow，需要 LLM 决策的部分（规划、分析、审查）用 LangGraph，两者通过消息队列（Kafka）衔接。
+
+### 第二层：证据与定位
+
+**Q：Agent 上线后，用户反馈"分析报告内容跑题"，比如问"数码 GMV 为什么跌"，报告里掺了"服装类目趋势"。你怎么定位是 Planner 拆解错还是 Researcher 检索错？**
+
+用 LangGraph 的 trace 追踪每一步状态。第一，看 Planner 生成的 plan——打开 LangSmith 或 LangGraph 的 state log，看 Planner 输出的任务列表，如果 plan 里包含了"查询服装类目"这一步，是 Planner 错（LLM 理解 query 时发散了，可能是 system prompt 没约束"只查相关类目"）。第二，如果 plan 正确（只查数码），但 Researcher 执行 `query_metric(metric="GMV")` 时传了 `dimension="all_categories"`，是 Researcher 错（工具调用的参数错了，LLM 没把"数码"这个约束传进去）。第三，如果 Researcher 参数对但返回了全类目数据（中台 API 的默认行为），是工具定义的问题（`query_metric` 的 `dimension` 参数没设默认值或枚举约束）。具体定位：在 LangSmith 的 trace 里看每一步的 input/output，找到"数码 → 服装"这个错误的源头。根因 80% 在工具 schema 定义不清（参数没必填/没枚举约束），20% 在 Planner 发散。
+
+### 第三层：根因深挖
+
+**Q：你发现 Researcher 调用 `query_metric` 时经常传错参数（比如把 `start_date` 写成 `start`）。这是 LLM 能力问题还是工具定义问题？怎么根本解决？**
+
+根因是工具 schema 不够明确，LLM 要"猜"参数名。第一，**工具 schema 要用 OpenAPI/JSON Schema 严格定义**——每个参数有 `name`、`type`、`required`、`enum`、`description`，`description` 要写清"参数名是 start_date 不是 start，格式是 YYYY-MM-DD"。LLM 调用工具时看的就是这个 schema。第二，**加 few-shot 示例**——在工具描述里附 1-2 个正确调用示例（`query_metric(metric="GMV", start_date="2024-01-01", end_date="2024-01-31")`），LLM 会模仿格式。第三，**参数校验 + 友好报错**——工具执行前用 JSON Schema 校验参数，如果 `start_date` 缺失或类型错，返回明确错误（"参数 start_date 缺失，请传入 YYYY-MM-DD 格式的日期"），LLM 看到错误会自动修正重试（ReAct 循环）。第四，**工具名要自描述**——`query_metric` 不如 `query_business_metric_with_date_range` 明确，名字本身约束了 LLM 的理解。根本解是"把工具定义当成 API 设计"，LLM 是 API 调用方。
+
+**Q：那为什么不直接让 LLM 生成 SQL 去查数据库，而要封装成 `query_metric` 这样的工具？SQL 更灵活，不用预定义每个指标。**
+
+LLM 直接生成 SQL 有三个生产风险。第一，**安全性**——LLM 可能生成 `DROP TABLE` 或查敏感表（用户表），工具封装限制了可操作的 SQL（只允许 SELECT 指定表）。第二，**准确性**——LLM 不知道表结构（列名、JOIN 关系），生成的 SQL 经常跑不通，而 `query_metric` 工具把 SQL 生成逻辑封装在后端（确定的 SQL 模板），LLM 只传 `metric="GMV"`，后端映射到正确的表查询。第三，**性能**——LLM 生成的 SQL 可能没有索引、全表扫描，拖垮数据库，工具封装可以强制走索引（参数化的 SQL 预编译）。Text-to-SQL 适合"分析探索"场景（用户自助查数据，有权限隔离），Agent 工具调用适合"自动化流程"（确定性强、安全性要求高）。两者结合：Agent 调用 `query_metric`（安全）+ 必要时调 `run_sql`（沙箱隔离 + 只读权限）。
+
+### 第四层：方案权衡
+
+**Q：多 Agent 协作（Planner + Researcher + Analyst + Writer）每次任务要调 5-8 次 LLM，单次任务成本 0.5 元。客服场景日均 100 万请求，一天 50 万 LLM 成本。怎么降成本？**
+
+多级降本。第一，**小模型分级**——Planner 和 Writer 用 72B（复杂推理），Researcher 和 Analyst 用 7B（简单工具调用），单次任务成本从 0.5 元降到 0.15 元（7B 的 token 成本是 72B 的 1/10）。实测 7B 做工具调用准确率 90%（72B 是 95%），够用。第二，**缓存**——相同 query 的 Planner 输出（任务拆解）缓存（Redis，TTL 1h），高频问题（top-1000 query）命中缓存直接复用，省 Planner 的 LLM 调用。第三，**状态压缩**——多 Agent 协作时，每个 Agent 把历史消息传给下一个 Agent，token 累积。用"摘要传递"（只传 summary 不传完整 history），token 从 8K 降到 2K。第四，**并行化**——Researcher 和 Analyst 能并行的步骤用 LangGraph 的 `add_edge(parallel=True)` 并行执行，减少串行 LLM 调用次数。优化后单次成本从 0.5 元降到 0.08 元，日均 8 万元。
+
+**Q：为什么不直接用单 Agent（一个大模型 + 所有工具），而要拆成多个 Agent？单 Agent 调用次数少，不是更便宜吗？**
+
+单 Agent 的成本陷阱在"工具数量爆炸"。第一，**工具过多导致选择错误**——单 Agent 注册 50 个工具（特征/模型/实验/数据 API），LLM 的 system prompt 要描述 50 个工具，token 多（prompt 就 5K），且 LLM 在 50 个工具里选对的准确率随工具数下降（研究显示 >15 个工具时准确率从 90% 降到 60%）。第二，**上下文窗口浪费**——单 Agent 要在 context 里维护所有中间结果和对话历史，token 累积快，长任务容易超 context（32K window）。第三，**可维护性**——单 Agent 的 prompt 要覆盖所有场景，改一个工具的描述可能影响其他工具的选择。多 Agent 按职能拆分（Researcher 只管查数据、Analyst 只管分析），每个 Agent 的工具少（5-8 个）、prompt 短、选择准。成本上多 Agent 虽然调用次数多，但每次调用的 token 少（prompt 短）、小模型能用，总成本反而更低。单 Agent 适合工具 < 10 个的简单任务。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么证明多 Agent 协作比单 Agent 的任务完成率更高？**
+
+三个维度的对照实验。第一，**离线评估集**——准备 200 个已知答案的任务（"分析数码 GMV 跌因"的正确报告是人工标注的），单 Agent 和多 Agent 分别跑，对比 `task_completion_rate`（报告是否包含关键结论）和 `tool_call_accuracy`（工具调用参数正确率）。多 Agent 预期 task_completion_rate 85%（单 Agent 70%），tool_call_accuracy 92%（单 Agent 75%）。第二，**线上 A/B**——单 Agent 和多 Agent 各 50% 流量，对比 `user_satisfaction`（点赞率）和 `first_try_success`（用户第一次提问就解决），连续 2 周看是否稳定提升。第三，**成本效率比**——单 Agent 成本低但完成率低，多 Agent 成本高但完成率高，算"单次成功任务的成本"（total_cost / successful_tasks），如果多 Agent 的单位成功成本更低，证明多 Agent 更优。
+
+**Q：Agent 系统上线后怎么监控"它在做什么"，防止它做了不该做的事（比如调了高危工具）？**
+
+三道防线。第一，**全链路 trace**——每次 Agent 执行都记录到 LangSmith/自建 trace 平台，包括每一步的 input/output、工具调用、LLM 推理过程，可视化展示决策链路（`planner → researcher → analyst → writer`）。第二，**高危工具审计**——`rollback_model`、`delete_data` 这类工具加 `@RequireConfirmation`（需人工确认）和审计日志（记录 who/when/what），每周 review 高危工具调用记录。第三，**异常检测**——监控 `tool_call_frequency`（某工具调用突增可能是 Agent 失控）、`task_step_count_p99`（单任务步数过多可能死循环）、`tool_error_rate`（工具调用错误率高可能 schema 有问题），异常自动告警 + 暂停 Agent。Agent 的可观测性比传统系统更重要，因为它的决策是 LLM 黑盒推理的，必须把每一步都记录可审计。

@@ -101,3 +101,71 @@ CHM 的演进是**锁粒度从粗到细**：Segment（16）→ 桶（16→扩容
 1. **JDK 8 为什么用 synchronized 而非 ReentrantLock**？——JDK 6+ synchronized 优化后性能接近，内存占用少；桶级锁竞争低，synchronized 足够。
 2. **size 准吗**？——弱一致（CounterCell 分片计数），但接近准确。
 3. **put 会丢数据吗**？——不会，每次 put 在桶锁内完成。
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：供应链商品本地缓存你用 ConcurrentHashMap 而不是 Caffeine。Caffeine 有 W-TinyLFU 淘汰策略和异步刷新，CHM 什么都没有，为什么选 CHM？**
+
+因为 CHM 是"可控的底层数据结构"，Caffeine 是"带策略的缓存框架"。选 CHM 的场景是"不需要淘汰策略的短期持有"——比如单次请求上下文缓存（`RequestId → Context`，请求结束就清）、或者配合外部控制生命周期的场景（如自己实现定时刷新）。Caffeine 适合"长期缓存 + 需要淘汰 + TTL"。供应链的商品本地缓存其实应该用 Caffeine（有 maximumSize 和 TTL 需求），用 CHM 是历史遗留或简单场景。如果是千万级 SKU 缓存，必须 Caffeine（CHM 无上限会 OOM，见 002 题）。
+
+### 第二层：证据与定位
+
+**Q：线上商品缓存（CHM 实现）大促时 CPU 飙到 90%，jstack 发现大量线程卡在 `computeIfAbsent`。你怎么定位是 CHM 扩容还是桶锁竞争？**
+
+看 jstack 堆栈和 CHM 内部状态：
+1. **看堆栈位置**——如果卡在 `transfer` 方法（扩容迁移），是并发扩容，线程在协助迁移桶；如果卡在 `synchronized` 的 `Node` 桶锁，是桶锁竞争（大量线程 hash 到同一桶）。
+2. **看扩容状态**——`size()` 如果从平时的几万突然涨到几百万（大促缓存暴涨），CHM 会触发扩容（`tryPresize`），扩容期间多线程协助迁移，CPU 飙高是扩容开销。
+3. **看哈希冲突**——如果大量 key 的 hash 值相同（hash 函数差或 key 分布集中），同一桶链表很长，synchronized 锁头节点时多个线程排队。`arthas watch java.util.concurrent.ConcurrentHashMap size '{params, returnObj}'` 或打印 CHM 的桶分布看冲突。
+
+### 第三层：根因深挖
+
+**Q：jstack 显示卡在桶锁（synchronized Node），桶的链表有 2000 个节点。为什么链表这么长没转红黑树？**
+
+CHM 转红黑树有两个条件：链表长度 ≥ 8 **且** table 容量 ≥ 64。如果容量 < 64，`treeifyBin` 会先扩容而不是转树。根因可能是：
+1. **容量未达 64**——CHM 初始容量默认 16，如果没指定初始容量且 key 数量增长慢，容量一直 < 64，链表≥8 也不转树，只能靠扩容。查 `table.length`，如果 < 64 就是这个原因。
+2. **hash 碰撞极端**——2000 个节点在同一桶，不是正常 hash 分布（正常 Poisson 分布下 8 个节点概率 0.00000006）。根因是 key 的 hashCode 实现差（如 `Long.hashCode` 对某段 id 区间碰撞）或 key 集中（如所有商品 key 都以某前缀开头，hash 到同桶）。
+解法：指定足够初始容量（`new ConcurrentHashMap<>(预期大小 / 0.75 + 1)`）避免频繁扩容；如果 hash 碰撞极端，换 key 策略（加扰动 `hash ^= (hash >>> 16)`）。
+
+**Q：那为什么不直接用 Caffeine 替换 CHM，它内部也用 ConcurrentHashMap 但有淘汰策略，链表不会涨到 2000？**
+
+Caffeine 确实能解决（有 maximumSize 淘汰，缓存大小可控），但如果根因是"key 的 hash 碰撞极端"，换 Caffeine 也不彻底——Caffeine 底层还是 CHM，hash 碰撞照样链表长。治本要分两步：
+1. **修 hash 碰撞**——调查 key 的 hashCode 实现，如果是自定义 key，确保 hashCode 分散；如果是 Long 类型 id 集中在某段（如自增 id 1-10000），CHM 的 `spread` 函数（`(h ^ (h >>> 16)) & HASH_BITS`）应该能打散，除非有 bug。
+2. **加上限淘汰**——换 Caffeine 或给 CHM 加手动淘汰（`if (cache.size() > 500000) cache.clear()`），从规模上控制。
+两者结合，hash 修好 + 上限淘汰，链表不会长。
+
+### 第四层：方案权衡
+
+**Q：大促时 CHM 扩容导致 CPU 飙高，你设了足够初始容量避免扩容。但扩容是 CHM 的正常机制，彻底避免会不会有问题？**
+
+设大初始容量（如预期峰值大小 / 0.75）能避免扩容，代价是"常驻内存占用高"——平时流量低时 CHM 占用几 GB 内存（空桶数组）。权衡：
+1. **大促场景值得**——大促前一次性分配大数组（如 64GB 堆 × 1/4 = 16GB 给 CHM），避免大促时扩容卡顿。平时内存浪费可接受（大促机器本来就要多备）。
+2. **配合弹性**——非大促时缩减 CHM 容量（重建小容量实例），大促前扩容。但这需要业务配合，复杂。
+3. **替代方案**——用 Caffeine（maximumSize 固定，内部异步扩容对主线程影响小），彻底避免 CHM 的扩容 STW。供应链热点缓存推荐 Caffeine，CHM 适合"容量可控、不需要淘汰"的场景。
+
+**Q：为什么不直接用 Collections.synchronizedMap 或 Hashtable，它们也是线程安全的 Map？**
+
+性能差一个数量级：
+1. **锁粒度粗**——`synchronizedMap` 锁整个 Map 对象，所有读写都串行；Hashtable 也是锁整个 this。CHM 锁单个桶，不同桶完全并行，并发度 = 桶数。
+2. **读阻塞**——`synchronizedMap` 读也要锁（`synchronized(mutex)`），写时读阻塞。CHM 读完全无锁（volatile），读写不互相阻塞。
+3. **并发扩容**——CHM 多线程协助迁移，`synchronizedMap` 扩容单线程。
+所以高并发场景 CHM 是唯一选择，`synchronizedMap`/Hashtable 只适合极低并发（QPS < 100）的兼容场景。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么证明 CHM 的使用没有性能瓶颈（桶锁竞争、扩容开销）？**
+
+两个监控：
+1. **桶分布监控**——定期采样 CHM 的桶链表长度分布（通过反射读 `table` 数组的 `Node.next` 链长度），统计 `max_bucket_size` 和 `avg_bucket_size`。max > 64 说明 hash 碰撞严重或没转树，要修 hash 或扩容。
+2. **扩容频率**——`size()` 增长趋势，如果频繁翻倍（16→32→64→128），是初始容量设小了。监控 `transfer` 方法在 jstack 里的出现频率，> 1% 时间花在 transfer 说明扩容是瓶颈。
+
+**Q：怎么让团队规范使用并发集合（CHM/Caffeine/AtomicXxx），而不是误用 HashMap/Hashtable？**
+
+沉淀规范：
+1. **Code Review 规则**——所有共享的 Map/List 必须用并发版本（CHM/CopyOnWriteArrayList），裸 `HashMap` 在多线程场景 CR 不通过。静态分析（SpotBugs）扫"HashMap 在多线程访问"报 high。
+2. **缓存选型指南**——明确"需淘汰/TTL 用 Caffeine，不需淘汰用 CHM，单次请求上下文用 HashMap，全局共享禁用 HashMap"。文档给每种场景的示例代码。
+3. **初始容量规范**——CHM 创建必须指定初始容量（`new ConcurrentHashMap<>(expectedSize / 3 * 4 + 1)`），禁止裸 `new ConcurrentHashMap<>()`（默认 16 容量易扩容），CR 检查。
+

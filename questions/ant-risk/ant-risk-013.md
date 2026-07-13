@@ -205,3 +205,66 @@ Response<String> f3 = pipe.hget("feat:" + uid, "device_cnt_30d");
 pipe.sync();
 // 3 次查询合并成 1 次 RTT
 ```
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：风控的实时特征你用 Flink 滑动窗口（1h 窗口、5min 步长），而不是用 Redis 的 ZSET 自己维护时间序列。Flink 的价值在哪？决策依据是什么？**
+
+Redis 的 ZSET 能做"近 1 小时交易次数"（ZADD 时间戳为 score，ZCOUNT 算区间），但有两个瓶颈。一是计算位置——每次决策时在 Redis 现算（ZCOUNT + ZREMRANGEBYSCORE 清理），QPS 万级时 Redis CPU 飙升，且窗口逻辑分散在多个业务代码里维护成本高。二是状态管理——滑动窗口要维护"未过期的所有事件"，1 小时窗口内某大用户可能有几万条交易，ZSET 全量存内存成本高。Flink 把计算从"查询时现算"前移到"事件来时增量算"——每来一条事件，Flink 的窗口聚合器更新一个计数值（状态只存聚合结果不存明细），决策时只查一个数值（O(1)）。决策依据是 TCO——Flink 集群 20 台机器算所有用户的特征，Redis 方案要给每个大用户存明细、QPS 压力大，成本和性能都不如 Flink。Flink 还提供 watermark 处理乱序、checkpoint 保证 exactly-once，这些 Redis 自己实现成本极高。
+
+### 第二层：证据与定位
+
+**Q：风控决策时查实时特征发现 trade_cnt_1h=0，但用户明明刚交易了 5 次。你怎么定位是 Flink 没算出来还是特征服务查询的问题？**
+
+三段式定位（沿数据流逆流而上）：
+1. 先查 HBase（特征最终存储）——`hbase shell: get 'user_feature', 'uid_500', {COLUMN => 'cf:trade_cnt_1h'}`，看值是否为 0。如果 HBase 是 0，是 Flink 没写入；如果 HBase 有值（如 5）但查询返回 0，是特征服务或缓存问题。
+2. 如果 HBase 是 0，查 Flink——看 Flink Job 的 metrics：`numRecordsIn`（消费了多少 Kafka 消息）、`numRecordsOut`（输出了多少特征）。如果 In 在涨但 Out 不涨，是 Flink 算子卡住（如 keyBy 后某 key 数据倾斜、或算子抛异常进死锁）。看 Flink WebUI 的 backpressure 指标，如果某算子 backpressure=100%，是下游慢导致上游堆积。同时看 watermark 是否推进（如果 watermark 卡在几小时前，事件时间窗口不触发，特征不更新）。
+3. 如果 Flink In 不涨，查 Kafka——`kafka-consumer-groups.sh --describe --group risk-flink` 看 lag。如果 lag 几百万，是 Flink 消费跟不上（消费速度 < 生产速度），特征延迟。
+
+### 第三层：根因深挖
+
+**Q：你发现 Flink 的 watermark 卡在 2 小时前，导致 1h 窗口不触发。根因是什么？为什么 watermark 不推进？**
+
+Watermark 是 Flink 事件时间的"逻辑时钟"，卡住说明有"迟到很久的事件"在拖。根因看两点：
+1. Kafka 分区不均——如果某个 Kafka 分区没数据（生产者没往那个分区写），基于"所有分区最小 watermark"的策略下，watermark 被这个空闲分区卡住。这是 Flink 的已知坑（空闲源问题）。看 Flink WebUI 的 Source 算子各分区 watermark，如果某分区 watermark 是 Long.MIN_VALUE 或远低于其他，是空闲分区。解法是 `WatermarkStrategy.forBoundedOutOfOrderness` 配 `withIdleness(Duration.ofMinutes(5))`，标记空闲分区。
+2. 真实迟到事件——如果数据源（如 App 上报）有大量延迟上报的事件（事件时间戳是 2 小时前），且 watermark 策略 `forBoundedOutOfOrderness(Duration.ofMinutes(10))` 允许 10 分钟乱序，但实际乱序 2 小时，watermark 会被这些事件拉低。看 Source 的 `currentOutputWatermark` 和事件时间分布，如果大量事件时间戳 < watermark，是数据源问题。解法是调大 allowed lateness 或在 Source 前过滤明显迟到的事件。
+
+**Q：根因是 Kafka 空闲分区卡 watermark。那为什么不直接用 ProcessingTime（处理时间）替代 EventTime？就不存在 watermark 问题了。**
+
+ProcessingTime 确实没 watermark 问题，但它会"丢精度"。风控特征要求"近 1 小时交易次数"——EventTime 按事件发生时间算（用户 22:00 交易的事件就算进 22:00 的窗口），ProcessingTime 按 Flink 处理时间算（事件 22:00 发生但 22:30 才被 Flink 处理，就算进 22:30 的窗口）。如果 Flink 消费有延迟（Kafka lag），ProcessingTime 会把"过去的事件"算进"现在的窗口"，特征失真。风控场景下，一笔欺诈交易如果因网络延迟晚到 5 分钟，EventTime 仍能正确归入发生时刻的窗口，ProcessingTime 会错误归入处理时刻的窗口。精度损失对风控是硬伤（误判漏判），所以必须用 EventTime + watermark，并解决空闲分区问题（withIdleness）。
+
+### 第四层：方案权衡
+
+**Q：你解决了 watermark 问题，特征实时性恢复了。但业务说 Flink checkpoint 导致状态后端（RocksDB）偶尔几秒级停顿，特征查询超时。怎么权衡 exactly-once 和延迟？**
+
+checkpoint 的代价是"barrier 对齐 + 状态快照"，大状态下 checkpoint 可能耗时几秒，期间算子可能 backpressure。权衡方案是分级：
+1. 对强一致要求的特征（如交易计数，用于扣款决策），保留 exactly-once（aligned checkpoint），接受偶发延迟，用 HBase + Redis 缓存兜底（决策查 Redis 不直接等 Flink）。
+2. 对弱一致要求的特征（如"近 1 小时登录次数"用于风险打分，差一两次无碍），用 unaligned checkpoint（Flink 1.11+）或降低 checkpoint 频率（从 1 分钟到 5 分钟），减少停顿。
+3. 状态分拆——把大状态（如全量用户窗口）拆成多个 Flink Job（按 uid hash 分），单 Job 状态小、checkpoint 快。
+关键认知：风控特征查询走的是 HBase/Redis（Flink 的输出），不是直接查 Flink 状态。Flink checkpoint 停顿只影响"特征更新延迟"（Flink 写入 HBase 变慢），不影响"特征查询"（HBase/Redis 独立服务）。所以即使 Flink 停顿 5 秒，特征查询 RT 不受影响，只是特征值滞后 5 秒更新——这对"近 1 小时窗口"特征可接受。
+
+**Q：为什么不直接用 Spark Structured Streaming 或 Kafka Streams 替代 Flink？它们也支持流处理。**
+
+Kafka Streams 是轻量（嵌入应用），但它的状态后端不如 Flink 的 RocksDB 能支撑大状态（TB 级），且 exactly-once 依赖 Kafka 事务（所有源和汇都得是 Kafka）。风控特征要从 Kafka 算、写 HBase/Redis（非 Kafka），Kafka Streams 的 exactly-once 不适用。Spark Structured Streaming 是微批（默认 100ms 一批），延迟比 Flink 的纯流（毫秒）高一个量级，风控特征要求毫秒级更新，Spark 的秒级微批不够。Flink 的纯流 + 大状态 + exactly-once（含非 Kafka 源汇）组合是风控实时特征的最佳匹配。选型依据是延迟要求和状态规模——风控两者都要求高，Flink 是唯一选择。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么验证实时特征的质量（准确性 + 实时性）？怎么知道 Flink 算的特征和离线 Spark 算的一致？**
+
+双轨对账验证准确性和实时性：
+1. 离线在线一致性对账——每天跑一个对账任务，取同一时间窗口（如昨天 10:00-11:00）的某特征（trade_cnt_1h），分别从离线 Spark 结果（Hive）和实时 Flink 结果（HBase）取值，按 uid 对比。统计"差异 >1% 的 uid 占比"应 <0.1%。常见差异来源是 watermark 丢事件（迟到事件在实时被丢、离线全量包含），通过调 allowed lateness 缩小差异。
+2. 实时性指标——Flink 暴露 `currentOutputWatermark`，对比当前处理时间，差值应 <5 分钟（窗口触发延迟 + watermark 容忍）。同时监控 Kafka consumer lag，lag >10 万告警（消费跟不上）。
+3. 端到端延迟埋点——在事件源头打时间戳（event_time），在特征写入 HBase 时算 `now - event_time`，上报 Prometheus，P99 应 <1 分钟（事件发生到特征可用）。
+
+**Q：怎么让团队的特征开发规范、不踩实时计算的坑？**
+
+沉淀成规范和平台：
+1. 特征平台统一收口——所有特征必须通过特征平台注册（定义 SQL、类型、TTL），平台自动生成 Flink Job 和离线 Spark Job，保证离线在线一致。禁止各团队自己写 Flink Job。
+2. SQL 化配置——特征定义用 SQL（Flink SQL 或平台 DSL），不用 DataStream API，降低复杂度和出错率。平台校验 SQL（必须有 watermark、必须有 keyBy、必须设 idle timeout）。
+3. 监控基线——每个 Flink Job 暴露 numRecordsIn/Out、watermark、checkpoint 时长、consumer lag，Grafana 看板 + 告警（lag >10 万、checkpoint 失败、watermark 停滞 >10 分钟）。
+4. 对账常态化——每天自动跑离线在线对账，差异 >阈值自动告警，特征 owner 必须复盘。
+5. 故障复盘——把这次"Kafka 空闲分区卡 watermark → 1h 窗口不触发 → 特征为 0 → 决策漏判"的 Flink WebUI 截图、watermark 曲线、withIdleness 解法存知识库，作为"EventTime 必须处理空闲源"的案例。

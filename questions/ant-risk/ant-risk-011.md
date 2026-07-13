@@ -230,3 +230,65 @@ B+ 树和 LSM 是数据库存储的两个流派：
 LoadIncrementalHFiles loader = new LoadIncrementalHFiles(conf);
 loader.doBulkLoad(new Path("/tmp/hfiles"), table);  // MapReduce 生成 HFile → 直接 load
 ```
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：风控用户画像你存在 HBase 而不是 MySQL 或 Redis。亿级用户 × 千字段，决策依据是什么？为什么不全用 Redis（内存数据库更快）？**
+
+三个维度决定用 HBase：容量、写吞吐、查询模式。容量上，亿级用户 × 千字段 × 平均 100B ≈ 10TB，Redis 全内存放 10TB 成本极高（内存单价是磁盘 50 倍）。写吞吐上，实时特征流每秒百万次写入，MySQL 单机写万级、Redis 单机写十万级但持久化有瓶颈，HBase 的 LSM 顺序写可达百万级且持久化在 HDFS。查询模式上，风控决策按 uid 单行查询 + 取部分列族，HBase 的 RowKey 点查 + 列族过滤正好匹配，RT 在 5-10ms（BlockCache 命中时 <2ms）。Redis 的角色是"HBase 的前置缓存"——热用户（最近活跃）的特征先查 Redis（<1ms），未命中再查 HBase，不是替代 HBase。决策依据是 TCO（总成本）：HBase 10TB 约 50 台磁盘机，Redis 同容量要 500 台内存机，成本差 10 倍。
+
+### 第二层：证据与定位
+
+**Q：风控决策服务查 HBase 的 RT 突然从 10ms 飙到 200ms。你怎么确认是 HBase 侧问题还是网络/客户端问题？**
+
+三组证据定位：
+1. HBase RegionServer 指标——HBase JMX 暴露了 `regionserver.Server.Get_max`（get 操作最大耗时）、`regionserver.Server.Get_mean`（平均耗时），如果这两个值飙升，是 HBase 侧慢。进一步看 `regionserver.Server.QueueReadSize`（读队列堆积）、`regionserver.Server.blockCacheHitCount`（缓存命中数）——如果 BlockCache 命中率从 80% 掉到 30%，是缓存失效（冷数据查询增多或缓存被挤占）。
+2. HBase UI 看 Compaction 状态——`hbase shell: status 'detailed'` 看是否有 RegionServer 正在执行 Major Compaction（`compactionState=MAJOR`），Major Compaction 会占大量 IO，导致读写慢。
+3. 客户端侧网络——如果 HBase 侧指标正常（Get_mean <5ms）但客户端 RT 200ms，是网络或客户端连接池问题。`ping regionserver_ip` 看网络延迟，`arthas trace HTable get '#cost>100'` 看是 HBase.get 慢还是连接池等待慢。
+
+### 第三层：根因深挖
+
+**Q：你定位到是 BlockCache 命中率从 80% 掉到 30%，导致大量请求穿透到磁盘 HFile。根因是什么？为什么缓存突然失效？**
+
+BlockCache 失效有几种根因。看 HBase 的 BlockCache 配置和访问模式：
+1. 缓存容量不足——`hfile.block.cache.size=0.4`（默认 40% heap）。如果最近有新业务上线（如查全量用户的历史画像做模型训练），扫描了大量冷数据，把热数据挤出缓存（LRU 淘汰）。看 `regionserver.Server.blockCacheEvictionCount` 是否飙升。
+2. MemStore 占用挤压——`hbase.regionserver.global.memstore.upperLimit=0.4`，如果写突增导致 MemStore 占满，BlockCache 可用空间被压缩。看 `regionserver.Server.memStoreSize` 是否接近上限。
+3. Region 迁移——HMaster 做 balance 把某些 Region 迁到别的 RegionServer，新 RegionServer 的 BlockCache 是冷的，命中率为 0，需要预热。看 HMaster UI 的 `balancer` 日志。
+真实案例常见是第 1 种——离线分析任务扫了全表，把在线热用户挤出缓存。验证方法：看 BlockCache 的"被驱逐的 key"分布，如果大量驱逐的是 user_001~user_100000（热用户），而缓存里留下的是离线任务的扫描范围，实锤。
+
+**Q：根因是离线扫描挤占在线缓存。那为什么不直接把 BlockCache 调大？调大不就解决了吗？**
+
+调大 BlockCache 是治标。Heap 是固定的（64GB），BlockCache 从 40% 调到 60%，MemStore 只剩 30%，写吞吐下降（MemStore 小了更频繁 Flush）。而且离线扫描的数据量是 10TB，再大的 BlockCache 也装不下，扫描完照样把热数据挤出去。治本是"读写隔离"——在线查询和离线分析用不同的 HBase 集群（或同一集群的不同 RegionServer 池）。离线分析走"只读副本"（HBase 的 read replica 或 HDFS snapshot），不碰在线集群的 BlockCache。如果资源不允许双集群，退一步用 BucketCache 分层——L1 LruBlockCache 放热数据（小）、L2 BucketCache 放温数据（大，off-heap），离线扫描只影响 L2，L1 的热数据不被挤。
+
+### 第四层：方案权衡
+
+**Q：你做了读写隔离后缓存命中率恢复了。但业务说离线分析任务也变慢了（走副本有延迟）。怎么权衡在线查询和离线分析的优先级？**
+
+在线优先，离线让步。风控的核心 SLA 是"在线决策 RT <200ms"（影响用户支付体验），离线分析是"小时级 T+1 任务"（影响分析师效率）。优先级明确后，方案是资源配额 + 错峰：离线任务限定在低峰期（凌晨 1-6 点）跑、限制并发（同时只有 2 个 Scan）、用低优先级队列（HBase 的 `callQueue` 按读写分离 + 权重）。离线分析"变慢"从 1 小时变成 3 小时可接受（仍能在天亮前完成），但在线查询快 10 倍是硬需求。如果离线任务必须实时，考虑给它单独的 HBase 集群（成本换隔离）。权衡标准是 SLA 刚性——在线 SLA 不可妥协，离线 SLA 可弹性。
+
+**Q：为什么不直接换成 Cassandra（去中心化、无单点），避免 HBase 的 HMaster 单点和 Region 热点问题？**
+
+Cassandra 确实去中心化（无 HMaster），但它的最终一致性模型不适合风控。风控写入用户画像后，下一次查询（可能毫秒级后）必须读到最新值（强一致），Cassandra 的一致性级别（ONE/QUORUM/ALL）要达到强一致需用 QUORUM/ALL，性能下降且仍非严格强一致（Hinted Handoff 期间可能读到旧值）。HBase 的 Region 虽有"单点"（某时刻在一个 RegionServer），但这保证了强一致 + 可线性化。HMaster 单点问题有 HA 方案（多 HMaster + ZK 选主），Region 热点靠 RowKey 设计规避（hash 前缀）。风控选 HBase 是因为"强一致 + 写吞吐"组合，Cassandra 的"去中心化 + 最终一致"不匹配。只有最终一致可接受的场景（如物联网时序数据、社交 feed）才选 Cassandra。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么证明读写隔离后在线查询性能真的恢复了？怎么量化缓存命中率改善？**
+
+三组指标对比：
+1. BlockCache 命中率——`regionserver.Server.blockCacheHitCount / (blockCacheHitCount + blockCacheMissCount)`，隔离前 30%、隔离后 85%，且离线任务期间命中率不下降（之前离线任务一来命中率就掉）。
+2. Get 操作 RT——`regionserver.Server.Get_99th`（P99 耗时），隔离前 200ms、隔离后 8ms。同时看 Get 的 P999（`Get_99.9th`）从 1 秒降到 30ms，证明尾延迟也改善。
+3. 在线决策链路 RT——从决策服务看 HBase 调用的 RT P99 从 200ms 降到 10ms，整个决策链路 P99 从 500ms 降到 200ms，达到 SLA。
+对比时要注意流量归一化——用 Get QPS 归一化（Get RT / Get QPS），消除流量波动影响。
+
+**Q：怎么让团队避免离线任务搞挂在线 HBase？**
+
+沉淀成规范和工具：
+1. 读写隔离规范——所有离线分析（全表 Scan、批量导出）必须走 read replica 或独立集群，禁止在生产在线集群跑大范围 Scan。Code Review 检查 Scan 的 caching 和 limit 参数。
+2. Scan 参数规范——离线必须设 `scan.setCaching(100)`（批量拉取）、`scan.setLimit()`（限制行数）、错峰执行（cron 限定凌晨），违反则任务被 kill。
+3. 监控告警——BlockCache 命中率 <60% 告警、Get P99 >50ms 告警、Major Compaction 期间告警（手动控制时机）。
+4. 离线任务审计——HBase 开启 Audit Log，记录谁在什么时候跑了什么 Scan，每周 review 大 Scan 的合理性。
+5. 故障复盘——把这次"离线全表 Scan 挤占 BlockCache → 在线 Get 慢 → 决策超时"的缓存命中率曲线、Get RT 曲线、Scan 范围存知识库，作为"读写必须隔离"的案例。

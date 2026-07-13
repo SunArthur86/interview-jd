@@ -313,3 +313,63 @@ public class RiskDecisionService {
     }
 }
 ```
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼迫本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：风控全链路监控你选了 SkyWalking 而不是 Pinpoint 或 Zipkin。决策依据是什么？为什么 SkyWalking 更适合风控？**
+
+三个维度：性能开销、生态、功能。性能上，SkyWalking 的字节码增强开销 <5%（CPU），Pinpoint 约 5-10%（更细粒度的字节码改写），风控决策链路 RT 预算紧（P99 <50ms），监控开销要小。生态上，SkyWalking 是 Apache 顶级项目，社区活跃，对中国系中间件（Dubbo、Nacos、Sentinel、RocketMQ）支持好，风控技术栈正是阿里系，兼容性优。功能上，SkyWalking 同时提供 Metrics + Trace + Log（三合一），而 Zipkin 只做 Trace，需要额外配 Prometheus（Metrics）+ ELK（Log），运维多套系统。决策依据是压测对比——同 QPS 下 SkyWalking 的决策 RT P99 增加 2ms，Pinpoint 增加 4ms，Zipkin + Prometheus 组合增加 3ms 且要运维两套。SkyWalking 性能最优且三合一，是风控的最佳匹配。
+
+### 第二层：证据与定位
+
+**Q：风控决策 P99 RT 告警（>500ms），但业务方说"用户感知没这么慢"。你怎么确认是真实慢还是监控误报？**
+
+两组证据区分监控准确性：
+1. 对比客户端和服务端 RT——监控的 P99 是服务端处理时间，但用户感知的是端到端（含网络）。拉 CDN/网关的访问日志看客户端 RT，如果客户端 P99 也是 500ms，是真实慢；如果客户端 P99 是 50ms 但服务端 P99 500ms，是监控口径问题（如 SkyWalking 的 trace 只算了部分 span、或异步线程的 RT 统计错误）。看网关（如 Nginx）的 `$request_time` 和 `$upstream_response_time` 对比。
+2. 看监控的样本量——如果 P99 的样本只有 10 条（低峰期），一条异常就能拉高 P99，不具代表性。看 `histogram_quantile` 的桶分布，如果 P99 落在样本量极少的尾部，是噪音。改用 P95 或增加样本窗口（从 1 分钟到 5 分钟）看是否仍高。
+如果确认是真实慢，进 trace 定位是哪一段（见第三层）。
+
+### 第三层：根因深挖
+
+**Q：你进 SkyWalking 看慢请求的 trace，发现某个 Span "feature-service.get" 耗时 400ms，但点进去看没有子 Span。根因是什么？为什么这个调用没有子 Span？**
+
+没有子 Span 有两种情况：
+1. feature-service 内部没有埋点——如果 feature-service 没装 SkyWalking agent 或 agent 配置漏了某个插件（如 HBase 插件没启用），它的内部调用（查 Redis、HBase）不会有 Span，trace 断在这一层。根因是 feature-service 的监控缺失，要检查它的 agent 配置和插件列表。
+2. 调用本身就是单次操作——如果 feature-service.get 是直接查 HBase（一次 RPC），HBase 的客户端（如 HBase Client）没有 SkyWalking 插件支持，Span 就在 "feature-service.get" 停了，但这个 Span 包含了"网络 + HBase 服务端处理 + 网络"，400ms 可能是 HBase 慢。要手动在 feature-service 里加更细的埋点（`@Trace` 注解或手动 Tracer.span`），区分"网络时间"和"HBase 处理时间"。
+验证方法：在 feature-service 里加 arthas trace `com.xxx.FeatureService get '#cost>200'`，看是 HBase.get 慢还是别的。如果 HBase.get 慢，是 HBase 侧问题（查 HBase 的 Get_99th 指标）。
+
+**Q：根因是 HBase 慢但 trace 没透到 HBase 层。那为什么不直接给所有组件装 SkyWalking 插件，自动埋点全覆盖？**
+
+全组件自动埋点是理想，但有代价。一是 agent 体积——插件越多 agent jar 越大（SkyWalking agent 全插件可能 50MB+），启动慢、占 metaspace。二是性能开销——每个插件的字节码增强都有 CPU 和内存开销，全组件埋点可能让应用 RT 增加 10%+。三是兼容性——某些中间件的插件可能不稳定（如 HBase 2.x 的插件对老版本不兼容），全量启用可能引入 bug。实务做法是分层启用——核心链路的组件（HTTP、Spring Cloud、MySQL、Redis、Dubbo）全启用（这些插件成熟、开销小），非核心或冷门组件（HBase、特定 MQ）按需启用或手动埋点。对 HBase，如果插件不稳定，我们在 feature-service 里手动加 `@Trace("hbase.get")` 注解，用 Span 包装 HBase.get 调用，手动透传 traceId 到 HBase 的 RPC header（HBase 支持自定义 header），这样 trace 能透到 HBase 的 regionserver（如果 regionserver 也装了 agent）。
+
+### 第四层：方案权衡
+
+**Q：你加了 HBase 手动埋点后 trace 完整了。但业务说"风控链路 RT <50ms，监控开销占比高"。怎么权衡监控精度和性能开销？**
+
+分级采样 + 动态开关。分级采样——正常请求采样 1%（10ms 内的"快请求"只采样少部分），慢请求（>100ms）100% 采样，Error 100% 采样。这样大部分快请求的开销低（1% 采样的 agent 逻辑），慢请求和错误全记录（用于定位）。SkyWalking 支持 `trace.sample_n_per_3_secs` 配置采样率，也支持按"慢阈值"强制采样（`trace.slow_db_threshold`）。动态开关——通过配置中心控制采样率，平时 1%，故障期间临时调到 100%（全量采集辅助排查），故障后调回。开销量化——1% 采样时 agent 的 CPU 开销 <0.5%，对风控链路 RT 影响 <0.5ms，可接受。权衡点是"用采样换开销"，但保证慢请求和错误必采（它们才是需要定位的）。
+
+**Q：为什么不直接用 eBPF（如 Pixie）做无侵入监控，连 agent 都不用装，开销更低？**
+
+eBPF 确实无侵入（内核层抓包分析），但它有局限。一是语义深度——eBPF 抓的是网络包和系统调用，能拿到"HTTP 请求 + RT"，但拿不到应用层的业务语义（如"这个请求的 uid 是多少、命中了哪些规则"），而这些业务字段是风控 trace 的关键。二是 JVM 内部不可见——eBPF 看不到 JVM 内部的方法调用（如 FeatureService.get 内部的规则匹配耗时），只能看到 JVM 发出的网络调用。风控的很多慢是"JVM 内部计算慢"（如规则引擎匹配），eBPF 看不到，必须用 agent 字节码增强。eBPF 适合"基础设施层监控"（网络、内核），Java agent 适合"应用层监控"（业务方法、JVM 内部）。风控要业务可观测性，agent 更合适。eBPF 可以作为补充（监控网络层异常），但不替代 agent。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么验证全链路监控的覆盖率——所有关键调用都被 trace 了、没有断链？怎么量化"监控健康度"？**
+
+三个量化指标：
+1. trace 完整性——统计"trace 的平均 span 数"，风控决策链路应该有 15-20 个 span（HTTP → 决策 → 特征 → HBase/Redis + 规则 + 模型）。如果某段时间平均 span 数掉到 5，说明某层 trace 断了（agent 漏装或采样丢失）。按服务维度统计 span 数，发现短板。
+2. 断链率——trace 跨服务时，下游服务的 trace 应该继承上游 traceId。统计"trace 在服务 A 调用服务 B 后，B 有 span 的比例"，应 >99%。如果 <95%，是 traceId 透传问题（如 MQ 消费没透传 traceId 到 header，或线程池没装饰 Runnable）。
+3. 采样命中率——慢请求（>100ms）和错误请求的 trace 采样率应 100%。统计"慢请求有 trace 的比例"，应 100%。如果慢请求没 trace（采样漏了），无法定位故障。
+
+**Q：怎么让团队的可观测性持续健康、不退化？**
+
+沉淀成规范和机制：
+1. 监控规范——新服务上线必须有基础监控（Metrics 暴露 + Trace agent + 结构化日志），SRE 验收否则不发版。监控项包括 QPS、RT P99、错误率、JVM、下游依赖。
+2. traceId 透传规范——所有跨边界（HTTP/RPC/MQ/线程池）必须透传 traceId，Code Review 检查。线程池用封装好的 TraceExecutorService（自动装饰 Runnable），禁止裸 submit。
+3. 监控覆盖率巡检——每周自动扫描所有服务的 trace span 数、断链率、慢请求采样率，输出报告，低分服务要整改。
+4. 告警治理——定期 review 告警的有效性（告警 → 真实故障的转化率），噪音告警调阈值或下线。目标是告警精准（少而准）。
+5. 故障复盘——每次故障复盘时 review"监控是否及时发现了故障、定位链路是否顺畅"，如果监控没覆盖到，补埋点。把这次"HBase 慢但 trace 没透到 HBase 层"的 trace 截图、手动埋点方案存知识库。

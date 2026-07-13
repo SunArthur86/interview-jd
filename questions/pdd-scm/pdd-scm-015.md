@@ -121,3 +121,78 @@ Cancel：回滚（解冻）
 1. **TCC 和 2PC 区别**？——2PC 资源层（DB 锁）；TCC 业务层（业务代码实现 Try/Confirm/Cancel）。
 2. **本地消息表为什么可靠**？——业务和消息同事务，要么都成功要么都失败；定时投递保证最终送达。
 3. **RocketMQ 事务消息原理**？——半消息 + 本地事务 + 回查，和本地消息表思路类似但 MQ 原生支持。
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：下单扣库存你选了本地消息表 + Kafka 而不是 TCC。TCC 能做到强一致（Try 阶段就冻结库存），为什么供应链不用？**
+
+TCC 的强一致代价在供应链场景不划算：
+1. **业务侵入重**——库存服务要拆 `tryDeduct`（冻结）、`confirmDeduct`（确认扣减）、`cancelDeduct`（解冻），每个业务动作写三遍。供应链有几十种业务事件（下单/退款/预售/换货），全拆 TCC 代码量爆炸。
+2. **资源冻结久**——TCC 的 Try 阶段冻结库存，用户下单到支付可能间隔几十分钟（犹豫），库存被冻结几十分钟影响其他用户购买。供应链宁可让多个用户"同时下单成功"，支付时才真正扣减（超卖由支付环节的二次校验兜底），也不要长期冻结。
+3. **TCC 适合"瞬时强一致"**——如扣款（钱必须立刻扣掉），不适合"长流程 + 资源可短暂超额"。本地消息表是"订单先建，库存异步扣，失败补偿"，更契合电商节奏。
+
+### 第二层：证据与定位
+
+**Q：用户反馈下单成功但库存没扣（商品还能继续下单，导致超卖）。你怎么定位是本地消息表没投递、Kafka 丢了，还是库存服务没消费？**
+
+四段排查：
+1. **看 outbox 表**——`SELECT * FROM outbox WHERE order_id=? AND event_type='OrderCreatedEvent'`，确认消息表有记录。如果没有，是订单服务写 outbox 失败（事务回滚了？但订单却创建了？说明 outbox 和 order 没同事务）。
+2. **看 outbox 状态**——如果有记录，看 `status` 字段（`PENDING/SENT/FAILED`）。如果一直是 `PENDING`，是定时扫描任务没跑（任务挂了或扫描频率太低）；如果 `FAILED`，是投递 Kafka 失败（看错误日志）。
+3. **看 Kafka**——`kafka-console-consumer --topic order-events --from-beginning | grep order_id`，确认消息是否到 Broker。如果 Broker 没收到，是投递链路问题；如果 Broker 有，看消费端。
+4. **看库存消费日志**——库存服务的日志搜 `onOrderCreated order_id=?`，如果没消费记录，是消费者没订阅或 offset 跳过；如果有但扣减失败，看扣减日志（库存不足？幂等冲突？）。
+
+### 第三层：根因深挖
+
+**Q：定位发现 outbox 表的 status 一直是 PENDING，定时扫描任务没投递。根因是什么？**
+
+根因大概率是"扫描任务设计缺陷"：
+1. **扫描频率太低**——任务是每 5 分钟扫一次，大促时消息积压 5 分钟才能投递，用户感知"库存没扣"。改成每 10 秒扫，或用 Canal 监听 outbox 表变更实时投递。
+2. **扫描任务单点挂了**——扫描任务是定时任务（如 XXL-JOB），如果调度器挂了或执行节点宕机，没人扫 outbox。看 XXL-JOB 的执行日志，确认任务是否在跑。
+3. **扫描 SQL 慢**——`SELECT * FROM outbox WHERE status='PENDING'`，如果 outbox 表积累了几百万条（扫描跟不上投递），SQL 全表扫慢，单次扫描超时。解法是加索引 `(status, create_time)` + 分批扫描（每次 1000 条）。
+定位：看 outbox 表的 `PENDING` 积压量，如果从平时的 100 涨到 10 万，是扫描任务的问题。
+
+**Q：那为什么不直接在 createOrder 里同步调库存服务（Feign RPC），扣成功才返回，而要用异步消息表？**
+
+同步调用有三个问题：
+1. **耦合 + 延迟**——下单要等库存扣减返回（多一次 RPC，50-100ms），用户感知慢。
+2. **故障传播**——库存服务挂了，下单也失败（强耦合）。库存是下游，不应该让它的故障阻塞订单。
+3. **分布式事务难题**——同步调用要做"订单创建 + 库存扣减"的分布式事务，要么 XA（锁久），要么 TCC（业务侵入）。本地消息表把"同步事务"拆成"本地事务（订单+消息）+ 异步扣减（最终一致）"，用最终一致换解耦和性能。
+代价是"秒级不一致"（下单后几秒才扣库存），但供应链可接受——用户下单到支付本来就有几秒到几分钟间隔，这几秒的不一致不影响业务（支付时二次校验库存）。
+
+### 第四层：方案权衡
+
+**Q：本地消息表的 outbox 会一直积累，你定时删除已投递的。但删除太频繁影响 DB 性能，删太慢 outbox 膨胀。怎么权衡？**
+
+三步策略：
+1. **软删除 + 分批**——投递成功后 `UPDATE outbox SET status='SENT' WHERE id IN (...)`（标记），不立即 DELETE。后台任务每天凌晨批量 `DELETE FROM outbox WHERE status='SENT' AND create_time < DATE_SUB(NOW(), INTERVAL 7 DAY)`，删除 7 天前的已投递记录（保留 7 天用于排查）。
+2. **分区表**——outbox 按天分区（`PARTITION BY RANGE (TO_DAYS(create_time))`），7 天前的分区直接 `ALTER TABLE outbox DROP PARTITION p20260701`，瞬间删除，不产生大量 binlog。
+3. **归档**——7 天前的 SENT 记录归档到冷存储（如 S3 或 Hive），outbox 表只保留近期热数据。
+
+**Q：为什么不直接用 RocketMQ 事务消息（半消息 + 回查），它原生支持事务，不用维护 outbox 表？**
+
+RocketMQ 事务消息确实省了 outbox 表，但有取舍：
+1. **MQ 绑定**——用 RocketMQ 事务消息意味着整个链路绑死 RocketMQ，换 MQ 要重写。本地消息表是 MQ 无关的（outbox 是 DB 表，投递到任何 MQ 都行）。
+2. **回查复杂**——RocketMQ 事务消息要实现 `checkLocalTransaction` 回查接口，Broker 会定期回查"本地事务到底成功没"。如果回查接口有 bug（如查 DB 超时），消息状态不确定。
+3. **团队熟悉度**——供应链团队已经用 Kafka，引入 RocketMQ 增加运维成本。本地消息表 + Kafka 是"用 DB 事务换 MQ 解耦"，简单可靠。
+所以如果团队已用 RocketMQ，事务消息是更优雅的方案；如果用 Kafka，本地消息表是标配。两者等价，选团队熟悉的。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么证明分布式事务方案（本地消息表）真的保证了最终一致、没有"下单成功但没扣库存"的漏单？**
+
+对账体系验证：
+1. **业务对账**——每天凌晨跑全量对账：`SELECT order_id FROM orders WHERE status='PAID' MINUS SELECT order_id FROM stock_log WHERE type='DEDUCT'`，差值就是"下单成功但没扣库存"的漏单，正常 = 0；> 0 告警人工补偿。
+2. **链路监控**——`outbox_pending_count`（待投递消息数）、`kafka_lag`（消费延迟）、`stock_deduct_fail_count`（扣减失败），任一异常告警。
+3. **端到端追踪**——用 SkyWalking 追踪 order_id 的完整链路（订单创建→outbox 写入→Kafka 投递→库存消费→扣减），任一 span 缺失说明链路断了。
+
+**Q：怎么让团队写跨服务事务时不再踩"漏消息/重复消费/补偿缺失"的坑？**
+
+沉淀事务框架：
+1. **Outbox SDK**——封装 `@TransactionalEventListener + outbox 写入`，业务方只写业务代码，框架自动同事务写 outbox + 定时投递 + 失败重试，不手写。
+2. **幂等 SDK**——`@Idempotent(key="#event.orderId", ttl=86400)` 注解，消费端自动去重。
+3. **Code Review 规范**——所有跨服务操作必须用 outbox（禁止裸 Feign 同步调用做"事务"），所有消费端必须幂等，所有补偿操作必须有对应的"正向操作日志"（便于回滚）。
+

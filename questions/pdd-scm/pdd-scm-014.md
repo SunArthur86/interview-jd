@@ -119,3 +119,72 @@ jmap -dump:format=b,file=heap.hprof <pid>
 1. **G1 和 CMS 区别**？——G1 Region 化、可预测停顿、Mixed GC；CMS 标记清除有碎片、Concurrent Mode Failure 退化为 Serial Old。
 2. **对象一定在堆上吗**？——不一定，逃逸分析可栈上分配（标量替换）。
 3. **怎么判断对象可回收**？——可达性分析（GC Roots 引用链），不可达则回收。
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：供应链服务大促前你把 GC 从 Parallel 换成 G1。Parallel 吞吐更高，为什么供应链不用？**
+
+Parallel 的吞吐高（GC 停顿时间占总运行时间比例低），但停顿是"单次长停顿"——Full GC 时 STW 几秒，对吞吐型应用（如离线批处理）无所谓，但对供应链这种"低延迟交易链路"是灾难。下单扣库存如果卡 3 秒，用户超时重试，雪崩。G1 的优势是"可预测停顿"——`MaxGCPauseMillis=200` 让每次 GC 停顿软目标 200ms，用 Region 化 + Mixed GC 把全堆 Full GC 拆成增量回收，单次停顿可控。供应链选 G1 是牺牲一点吞吐换延迟稳定。
+
+### 第二层：证据与定位
+
+**Q：上线 G1 后，大促时服务 P99 抖动到 800ms，监控显示是 GC 停顿。你怎么确认是 Young GC 慢还是 Mixed GC 慢？**
+
+看 GC 日志（`-Xlog:gc*`）和 jstat：
+1. **GC 日志区分类型**——`[GC pause (G1 Evacuation Pause) (young)]` 是 Young GC，`[GC pause (G1 Evacuation Pause) (mixed)]` 是 Mixed GC。看每条的 `Pause Time`，如果 Young GC 都 200ms+，是新生代回收慢（Eden 太大或存活对象多）；如果 Mixed GC 慢，是老年代 Region 回收慢。
+2. **jstat -gcutil**——`YGC`（Young GC 次数）和 `YGCT`（Young GC 总耗时），算 `YGCT/YGC` 是平均 Young GC 耗时；`FGC`（Full GC 次数），如果 FGC > 0，说明 Mixed GC 扛不住退化为 Full GC（最严重）。
+3. **G1 日志的 Region 统计**——看 `[Eden: 1024M(256)->0M(0) Survivors: 32M->32M Heap: 12G(2048)->11G(2048)]`，如果回收后 Heap 还剩 11G（老年代占用高），说明对象晋升过快，Mixed GC 压力大。
+
+### 第三层：根因深挖
+
+**Q：GC 日志显示 Mixed GC 停顿 600ms（超 MaxGCPauseMillis=200 的软目标）。G1 为什么没遵守停顿目标？**
+
+`MaxGCPauseMillis` 是"软目标"不是硬约束，G1 会根据历史数据预估"在目标停顿内能回收多少 Region"，但预估可能不准。根因有三：
+1. **IHOP 阈值不合理**——`InitiatingHeapOccupancyPercent` 默认 45%，老年代占用 45% 才触发并发标记。如果调得太高（如 55%），老年代堆太满才开始 Mixed GC，单次要回收的 Region 多，停顿超目标。调低到 35% 提前标记。
+2. **大对象（Humongous）多**——超过 Region 一半的对象是 Humongous，G1 单独分配 Region 存。如果 Humongous 多（如大数组、大 JSON），Mixed GC 要扫描这些 Region，停顿长。看 GC 日志的 `[Humongous regions]` 计数。
+3. **记忆集（RSet）更新慢**——跨 Region 引用要维护 RSet，如果引用关系复杂（"跨代引用"多），Mixed GC 更新 RSet 耗时长。`-XX:G1SummarizeRSetStats` 能看 RSet 统计。
+根因定位：调 IHOP + 优化大对象分配（拆分或避免）+ 看 RSet 大小。
+
+**Q：那为什么不直接把 MaxGCPauseMillis 调到 50ms，让 G1 更激进地控制停顿？**
+
+调小停顿目标会适得其反：
+1. **GC 频率飙升**——G1 为了满足 50ms 停顿，每次只回收少量 Region，GC 次数翻几倍，总 GC 耗时（吞吐）反而上升。
+2. **回收不充分**——每次回收太少，老年代涨得比回收快，最终触发 Full GC（退化为 Serial Old，停顿几秒），比 200ms 停顿惨得多。
+3. **软目标本质**——G1 是"尽力而为"，设 50ms 不是硬保证。要真正亚毫秒停顿只能换 ZGC/Shenandoah（但吞吐代价 10-15%）。200ms 是 G1 的甜点，配合 IHOP 和 Region 大小调优，比硬调 MaxGCPauseMillis 有效。
+
+### 第四层：方案权衡
+
+**Q：你的供应链服务堆 16GB，大促时发现 Humongous 对象多（库存批量查询返回的大 List），Mixed GC 停顿长。怎么办？**
+
+两个方向：
+1. **减小 Humongous**——`G1HeapRegionSize=16m` 时，> 8MB 的对象算 Humongous。根因是 `SELECT * FROM stock WHERE category_id=?` 一次返回 10MB 数据。解法是分页查询（每次 1000 条，约 100KB），从源头消除大对象。
+2. **调大 Region**——`G1HeapRegionSize=32m`，Humongous 阈值变 16MB，原来的 10MB List 不再是 Humongous。但 Region 调大意味着单 Region 回收停顿长（复制更多对象），要权衡。一般 Region 大小按堆规模的 1/2048 选（16GB 堆 → 8MB Region）。
+
+**Q：为什么不直接换成 ZGC，亚毫秒停顿彻底解决 Mixed GC 慢的问题？**
+
+ZGC 适合"超大堆 + 超低延迟"场景（堆 > 32GB、停顿 < 10ms），供应链 16GB 堆用 ZGC 不划算：
+1. **吞吐代价**——ZGC 的并发标记/转移用染色指针和读屏障，CPU 开销比 G1 高 10-15%，同样 QPS 要多 15% 机器。
+2. **成熟度**——ZGC 在 JDK 15 才 production-ready（JDK 21 才默认 generational），供应链线上跑 JDK 11/17，ZGC 还非默认。
+3. **问题已治本**——Humongous 慢的根因是大对象（大 List），分页查询消除大对象后，G1 的 Mixed GC 就能稳在 200ms 内。换 ZGC 是过度设计。
+只有当堆 > 32GB（如内存计算场景）或停顿 < 50ms（如实时竞价）且 G1 撑不住，才考虑 ZGC。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么证明 G1 调优真的有效、大促时 GC 停顿可控？**
+
+三组数据对比验证：
+1. **GC 日志基线**——调优前后各跑 1 周大促压测，对比 `jstat -gcutil` 的 FGC 次数（应归零）、FGCT（应 = 0）、Young GC 平均停顿（应 < 100ms）。
+2. **APM P99**——调优前 P99 800ms，调优后 P99 < 200ms，且 GC 停顿占总延迟比例从 60% 降到 10%（`gc_pause / total_latency`）。
+3. **流量归一化**——`Full_GC_count / QPS` 调优后趋近 0，证明不是流量低导致 FGC 少，而是调优效果。
+
+**Q：怎么让团队的 JVM 配置规范统一、不再各自调参？**
+
+沉淀 JVM 规范：
+1. **JVM 参数模板**——按服务类型分（网关/交易/计算），每类一套标准参数（堆大小、GC、IHOP、监控），新服务启动套模板，禁止手调。
+2. **GC 日志强制开启**——所有线上服务必配 `-Xlog:gc*:file=/var/log/gc.log:time,level,tags`，接 ELK 分析，定期出 GC 报告。
+3. **GC 告警**——Full GC > 0 立即告警（P0），Young GC 停顿 > 500ms 告警（P1），值班 must action。大促前跑 GC 压测，FGC 不为 0 不让上线。
+

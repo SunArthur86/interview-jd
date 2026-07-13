@@ -256,3 +256,60 @@ public class OnRiskClusterCondition implements Condition {
 @Conditional(OnRiskClusterCondition.class)
 public class RiskClusterConfig { ... }
 ```
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：风控的 SDK 你封装成了 Starter（risk-sdk-spring-boot-starter）让业务方引入即用。为什么不用纯 SDK（jar 包 + 手动 new 对象）？Starter 的价值到底是什么？**
+
+纯 SDK 让每个业务方自己写初始化代码——`RiskClient client = new RiskClient(); client.setAppkey(...); client.setTimeout(...);`，几十个业务方写几十遍，配置项不一致（有的设 timeout=1000、有的设 3000）、初始化方式不一致（有的手动 new、有的塞进 Spring）、升级时每个业务方改代码。Starter 把这些统一起来——引入依赖自动装配 RiskClient Bean，配置走 application.yml（`risk.sdk.timeout=3000`），默认值由 SDK 团队统一维护，升级时只改 SDK 版本号。价值是"配置收口 + 升级无感"。决策依据是治理成本——纯 SDK 模式下 SDK 团队每周要帮 3-5 个业务方排查"为什么初始化错"，Starter 模式后降到每月 1 个。
+
+### 第二层：证据与定位
+
+**Q：业务方反馈引入 risk-sdk-spring-boot-starter 后 RiskClient 没注入（@Autowired 报 NoSuchBeanDefinitionException）。你怎么定位是 Starter 没生效还是别的？**
+
+三步定位：
+1. 让业务方启动时加 `--debug` 参数——Spring Boot 会打印自动装配报告（AutoConfiguration Report）。搜 `RiskAutoConfiguration`，如果在 "Negative matches" 里，会显示哪个 @Conditional 没满足。常见是 `@ConditionalOnProperty(prefix="risk.sdk", name="enabled")` 没配（业务方漏了 `risk.sdk.enabled=true`），或 `@ConditionalOnClass` 找不到类（依赖冲突导致 risk-sdk-core 没引入）。
+2. 检查 AutoConfiguration.imports 文件——`jar tf risk-sdk-spring-boot-starter.jar | grep AutoConfiguration.imports`，确认 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` 存在且内容是 `com.ant.risk.sdk.autoconfig.RiskAutoConfiguration`。如果文件缺失或路径错（如放成 spring.factories 但用 Spring Boot 3），Starter 不被加载。
+3. 检查包扫描——如果 RiskAutoConfiguration 在 `com.ant.risk.sdk` 包，但业务方的 @SpringBootApplication 在 `com.ant.biz` 且没扫到，且没走 AutoConfiguration.imports（走了 @ComponentScan），会漏。自动配置类应该走 imports 声明，不依赖 @ComponentScan。用 arthas `sc com.ant.risk.sdk.autoconfig.RiskAutoConfiguration` 看类是否被加载。
+
+### 第三层：根因深挖
+
+**Q：你发现是业务方的 application.yml 里 `risk.sdk.enabled=false`（误配），导致 RiskAutoConfiguration 的 @ConditionalOnProperty 不满足。根因是配置项默认值不友好？为什么不默认开启？**
+
+这要看 Starter 设计哲学。`risk.sdk.enabled` 默认 false（matchIfMissing=false）是"显式启用"策略，防止业务方"不知情引入"。但风控 SDK 是核心依赖（不引入就没法接入风控），默认 false 反而制造坑——业务方以为引入依赖就生效，实际还要配 enabled=true。根因是"配置项默认值设计与业务场景不匹配"。正确做法是分场景：核心能力默认开启（matchIfMissing=true，引入即用），可选能力默认关闭（如风险审计日志，默认关，要审计的业务方显式开）。我们的 `risk.sdk.enabled` 应该 matchIfMissing=true（默认开），想关闭的业务方显式配 `risk.sdk.enabled=false`。改完后统计 enabled 配置错误导致的工单应降到 0。
+
+**Q：根因是默认值设计。那为什么不直接去掉 enabled 配置项？反正核心能力都要开。**
+
+去掉更简洁，但失去了"紧急关闭"的能力。风控 SDK 偶发有 bug 时，业务方需要快速关闭风控调用（走降级），这时 `risk.sdk.enabled=false` 一行配置（配合配置中心热更新）就能关，不用改代码重新发布。如果去掉 enabled，关闭要走"注释代码 + 重新打包 + 发布"，慢。所以保留 enabled 但默认开启（matchIfMissing=true）是最优——平时开、紧急时一行配置关。这是"逃生通道"的设计，类似熔断器的"手动强制 OPEN"开关。
+
+### 第四层：方案权衡
+
+**Q：你的 RiskAutoConfiguration 用 @ConditionalOnMissingBean 让业务方可以覆盖默认 RiskClient。但业务方覆盖后出问题（如他们 new 的 RiskClient 配错参数），SDK 团队要背锅。怎么权衡可扩展性和可控性？**
+
+权衡方案是"开放扩展点但限定边界"。@ConditionalOnMissingBean 完全开放（业务方可以 new 任何 RiskClient），失控风险大。更稳的做法是提供"策略接口 + 默认实现"——SDK 定义 `RiskClientCustomizer` 接口，业务方实现它来定制（如改 timeout、加拦截器），而不是直接替换整个 RiskClient。RiskAutoConfiguration 注入所有 Customizer，在创建默认 RiskClient 时应用它们。这样业务方能定制（满足个性化），但 RiskClient 的创建和初始化仍由 SDK 控制（保证核心逻辑不被破坏）。代价是定制能力受限（只能改 SDK 暴露的点），但对风控 SDK 这种"核心逻辑敏感"的场景，可控性比灵活性重要。只有当业务方确实需要完全替换（如用 mock 做测试），才用 @ConditionalOnMissingBean 兜底。
+
+**Q：为什么不直接把 RiskClient 设成 final 类 + 构造器注入，禁止业务方覆盖？最简单可控。**
+
+final 类 + 构造器注入确实最可控，但完全封闭会逼业务方"绕过 SDK"（如自己发 HTTP 调风控接口），反而失控。风控场景的真实需求：大部分业务方用默认配置即可（80%），少数大客户要定制（如银行客户要加自己的签名逻辑、加审计日志）。完全封闭会让这 20% 的大客户无法接入，流失业务。所以"核心逻辑封闭（RiskClient 内部流程不变）+ 扩展点开放（Customizer 接口定制行为）"是平衡——80% 用默认、20% 通过扩展点定制、0% 绕过 SDK（因为 SDK 足够灵活）。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么验证 Starter 在不同业务方的 Spring Boot 版本（2.4/2.7/3.0）都能正确装配？怎么自动化测试？**
+
+矩阵式自动化测试：
+1. 多版本兼容性测试——在 CI 里建一个测试矩阵，针对 Spring Boot 2.4/2.7/3.0 + JDK 8/11/17 各组合，用 testcontainers 起一个最小 Spring Boot 应用，引入 risk-sdk-spring-boot-starter，启动后断言 `RiskClient` Bean 存在（`@SpringBootTest` + `@Autowired RiskClient`）。任何组合装配失败，CI 红灯。重点测 spring.factories（2.4-2.6）和 AutoConfiguration.imports（2.7+）的兼容。
+2. 条件覆盖测试——用 ApplicationContextRunner（Spring Boot 的测试工具）模拟各种条件（有/无配置、有/无类），断言 @Conditional 的行为。如 `new ApplicationContextRunner().withPropertyValues("risk.sdk.enabled=false").run(context -> assertThat(context).doesNotHaveBean(RiskClient.class))`。
+3. 自动装配报告校验——启动测试应用时加 --debug，解析自动装配报告，断言 RiskAutoConfiguration 在 "Positive matches"（正常）或验证特定条件下在 "Negative matches"。
+
+**Q：怎么让团队的 Starter 都规范、不踩坑？**
+
+沉淀成规范和模板：
+1. Starter 脚手架——提供 risk-sdk-starter-template 脚手架项目，包含标准目录结构、AutoConfiguration 模板、properties 类、AutoConfiguration.imports 文件、多版本兼容测试。新 Starter 基于模板创建，强制规范。
+2. 命名规范——官方 Starter 命名 `risk-xxx-spring-boot-starter`（第三方格式），禁止用 `spring-boot-starter-xxx`（官方保留格式）。CI 校验 artifactId 命名。
+3. 配置项规范——所有配置项必须有默认值（properties 类里 @DefaultValue）、必须文档化（properties 类的 Javadoc 自动生成配置文档）、核心开关默认开（matchIfMissing=true）、可选开关默认关。
+4. 自动装配报告 review——Starter 发布前，在示例应用跑 --debug，review 自动装配报告，确认 RiskAutoConfiguration 的 @Conditional 合理（不要因为无关条件误触发或误不触发）。
+5. 故障复盘——把这次"enabled 默认 false 导致业务方 NoSuchBeanDefinition"的自动装配报告截图、配置项规范存知识库，作为"Starter 配置项默认值设计"的案例。

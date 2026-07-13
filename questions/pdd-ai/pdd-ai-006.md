@@ -177,3 +177,49 @@ Object discount = runner.execute(rule, context, errorList, isCache, isTrace);
 1. **规则引擎为什么能热更新**？——规则编译成独立的 KnowledgeBase/AST，运行时替换引用（volatile），老会话执行完即生效新规则。
 2. **怎么保证规则正确性**？——发布前沙箱测试（历史数据回放）+ 灰度（5% 流量）+ A/B + 监控指标对比。
 3. **规则性能瓶颈在哪**？——规则数 × 条件数（Rete 网络节点），上百万规则要分片/索引/剪枝。
+
+## 苏格拉底式面试追问
+
+> 这组追问不背答案，模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：你们规则中台主推 Drools，但 Drools 重量级、预热慢，为什么不用 Aviator 这种轻量表达式引擎？营销规则大多是简单条件判断，Aviator 性能更好不是吗？**
+
+因为营销/风控规则不只是"简单条件判断"，还有决策表（多条件矩阵）、规则优先级冲突解决、规则分组互斥。比如风控授信规则"信用分>700 且收入>1w → 授信 10w；信用分 600-700 且收入>8000 → 授信 5w"，这是决策表，Drools 的决策表编辑器（运营可视化）+ Rete 网络共享条件（信用分判断只算一次，复用给多条规则）效率远高于 Aviator 逐条执行。Aviator 适合"单条表达式"（计价、折扣计算），Drools 适合"多规则集 + 复杂业务逻辑"。我们的做法是分层：复杂风控/授信用 Drools，高频简单计价用 Aviator，按场景选不是一刀切。
+
+### 第二层：证据与定位
+
+**Q：运营说刚配的一条促销规则上线后没生效，但配置中心显示规则已经推送了。你怎么排查是规则没加载还是规则加载了但没命中？**
+
+分两步定位。第一，确认规则是否加载——在规则引擎 SDK 加 `log.info("Rules reloaded: version={}, count={}", version, kieBase.getKiePackages().stream().mapToInt(p->p.getRules().size()).sum())`，业务侧日志里看有没有这次 reload 的记录和规则数量。如果 count 没增加，说明配置中心推送了但 SDK 没收到（Nacos 监听器没注册或 dataId 配错）。第二，确认规则是否命中——Drools 支持 `ksession.setGlobal("logger", ...)` 或用 `RuleRuntimeEventListener` 监听每条规则的 fire 情况，记录 `rule_name, fact, fired_or_skipped`。如果规则加载了但 fire=false，说明 when 条件没满足——把运营的测试 fact 和规则的 LHS（when 子句）对比，常见问题是字段名拼写不一致（规则写 `amount` 但 fact 里是 `orderAmount`）或类型不匹配（规则 `> 100` 但 fact 字段是 String）。
+
+### 第三层：根因深挖
+
+**Q：规则确实加载了、也命中了，但运营说"促销价不对"。Drools 的 rule fires 了但 then 里的赋值没生效，根因可能是什么？**
+
+最常见根因是"多规则冲突 + agenda 顺序"。Drools 是多规则系统，一次 fireAllRules 可能匹配多条规则，如果两条规则都修改 `discount` 字段（A 规则设 0.8，B 规则设 0.9），最终值取决于规则的 salience（优先级）或 agenda group 的执行顺序。用 `ksession.getAgenda().getAgendaGroup("promo").setFocus()` 控制组顺序，或给规则加 `salience=100`。另一个根因是"规则执行后被覆盖"——C 规则在 A/B 之后 fire，把 discount 重置成 1.0。排查手段：开 Drools 的 audit log（`ksession.setRuntimeLogger(new WorkingMemoryFileLogger(...))`），记录每条规则的 fire 顺序和 fact 修改轨迹，看 discount 的最终值是哪条规则设的。
+
+**Q：那为什么不直接用单规则引擎（每次只 fire 一条规则）避免冲突？Drools 的多规则 fire 不是自找麻烦吗？**
+
+单规则会失去 Rete 网络的核心优势——条件共享。授信场景下"信用分>700"这个判断在 10 条规则里都用，Rete 网络只算一次，结果共享给 10 条规则；单规则引擎要算 10 次。而且业务上"多规则同时命中 + 优先级仲裁"是真实需求（风控规则多条触发时取最严格的结果），单规则模式做不到。Drools 的 salience + agenda group + activation-group（互斥组）就是解决冲突的标准机制，不是缺陷，是要正确使用。复杂度是规则引擎的本质，规避不了，只能用规范（规则命名、salience 约定、CI 校验）管理。
+
+### 第四层：方案权衡
+
+**Q：你用配置中心（Nacos）做规则热更新，但 Drools 的 KieBase 重建很慢（上千规则要几秒）。这期间请求是阻塞还是用旧规则？**
+
+用"双 KieBase 切换"模式避免阻塞。后台线程异步构建新 KieBase（`KieServices.get().newKieBuilder(...).buildAll()` 耗时几秒），同时老 KieBase 继续服务线上请求；新 KieBase 构建完成后，通过 `volatile KieBase` 引用切换（CAS），老请求在老 KieSession 跑完即销毁，新请求用新 KieBase。这样热更新对业务透明，P99 不受影响。切换瞬间可能有极少数请求跨了边界（一个请求用了老规则、下一个用了新规则），但规则场景容忍这个（规则版本切换本来就允许短暂不一致）。
+
+**Q：为什么不直接用 Drools 的 KieScanner 做自动热加载？它不是官方支持的吗？**
+
+KieScanner 依赖 Kjar Maven 仓库（规则打包成 kjar 发到 Nexus），每次规则变更要 mvn deploy + KieScanner 轮询拉取。这个链路对运营不友好——运营在后台改规则，要研发打包发版才能生效，违背了"运营自助"的初衷。我们的方案是规则以 DRL/JSON 存数据库，运营后台编辑后直接推 Nacos，SDK 监听 Nacos 变更触发 KieBase 重建，全程不经过 Maven。KieScanner 适合"规则随代码版本管理"的研发场景，不适合"运营在线编辑"的业务场景。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么证明热更新后新规则真的对所有实例生效了？有没有可能某个 Pod 的 Nacos 监听器挂了，还在跑老规则？**
+
+三层验证。第一，规则版本号注册——每次规则发布带一个递增的 `rule_version`，SDK 加载后上报到 Prometheus（`gauge{rule_set="promo", version="v123", pod="xxx"}`），大盘看所有 Pod 的 version 是否一致，`version_skew_count > 0` 告警。第二，影子请求回放——规则发布后自动跑 100 条历史 fact，对比新规则结果和预期结果，准确率 < 99% 阻断发布。第三，在线对账——生产请求按 1% 采样，把 fact 同时打到新规则引擎跑一遍（影子执行），对比线上结果和新规则结果，`mismatch_rate > 0.1%` 告警，及早发现版本不一致。
+
+**Q：怎么让运营不再配出"规则冲突"的坑？**
+
+沉淀规范和工具。第一，规则上线强制走沙箱回放——运营配完规则后，系统自动用最近 7 天的历史请求回放，对比新规则前后的结果差异，差异 > 5% 的规则需主管审批。第二，规则冲突检测——发布前扫描所有规则的 LHS 和 salience，如果两条规则的 when 条件有重叠且 then 修改同一字段，警告"可能与规则 X 冲突，请确认 salience"。第三，灰度发布——新规则先 1% 流量灰度 30 分钟，监控 GMV/转化率等核心指标，异常自动回滚。第四，规则血缘记录——每条规则改了什么、谁改的、什么时候上的，存 Git 做版本管理，出问题秒级回滚到任意历史版本。

@@ -289,3 +289,60 @@ public class Counter {
 }
 // 适合字段多的类，避免每个字段都用 AtomicInteger 占用对象头
 ```
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：风控规则引擎的规则热加载你用 volatile 的 ruleSet 引用（`private volatile CompiledRuleSet ruleSet`），而不是用 ReadWriteLock 保护。决策依据是什么？**
+
+规则热加载的模式是"写极少（每天几十次）、读极多（每秒几万次）"。volatile 的读是无锁的（纳秒级，和普通读几乎一样），写是一次性引用替换（微秒级）。ReadWriteLock 的读锁虽然也"共享"，但读锁要走 CAS（AQS 的 state 共享模式），高并发下 CAS 有缓存行竞争，读 P99 比 volatile 高一个量级（亚微秒 vs 纳秒）。对几万 QPS 的 evaluate 方法，每秒几万次 CAS 累积的 CPU 开销明显。volatile 适合"一个引用的原子发布"，CompiledRuleSet 是个不可变对象（编译后不修改），volatile 写就是把新引用赋给 ruleSet，读就是拿当前引用，语义清晰且最快。决策依据是压测——同 QPS 下 volatile 的 evaluate RT P99 是 5ms，ReadWriteLock 是 7ms（读锁 CAS 开销），核心链路 2ms 差距值得。
+
+### 第二层：证据与定位
+
+**Q：风控规则热加载后，部分请求仍用旧规则（没感知到更新）。你怎么确认是 volatile 失效还是别的原因？**
+
+volatile 不会"失效"（JVM 规范保证），所以问题在别处。三种可能：
+1. 旧规则引用被缓存了——看 evaluate 方法是不是直接读 `this.ruleSet`，还是在某处缓存了规则集引用（如方法参数、局部变量）。如果有代码 `Rules r = this.ruleSet; ...` 在 reload 之前拿到旧引用，且后续逻辑用 r 而非 this.ruleSet，自然感知不到更新。用 arthas watch `com.xxx.RuleEngine evaluate '@com.xxx.RuleEngine@ruleSet'` 看每次 evaluate 时 ruleSet 引用的版本。
+2. 多实例未同步——如果风控决策服务有多台实例，规则热加载只更新了一台（如配置中心推送只到了部分实例）。看 Nacos 配置中心的推送状态，确认所有实例都收到了规则变更。
+3. 规则版本不一致——reloadRules 方法编译了新规则但赋值失败（如编译异常被吞），ruleSet 还是旧的。看 reloadRules 的日志，确认新规则编译成功且赋值执行。用 arthas ognl `@com.xxx.RuleEngine@ruleSet.getVersion()` 看当前版本号。
+
+### 第三层：根因深挖
+
+**Q：你发现是规则集对象不是真正不可变的——CompiledRuleSet 内部有个 HashMap，reload 时新引用指向新对象，但旧引用的 HashMap 被并发修改了（另一个线程在 reload 旧规则）。根因是什么？**
+
+根因是"不可变性约定被破坏"。volatile 的安全前提是"发布的对象是不可变的"（构造完成后不再修改）。如果 CompiledRuleSet 内部的 HashMap 在构造后被修改（如 evaluate 过程中往里加缓存），那么即使引用是 volatile 的，多线程看到的 HashMap 内部状态仍可能不一致（HashMap 非线程安全）。验证方法：看 CompiledRuleSet 的源码，是否有方法修改内部 HashMap（如 `putCache`）。如果有，破坏了不可变性。根因不是 volatile 没用对，是对象设计违反了"发布即不可变"的契约。
+
+**Q：根因是 CompiledRuleSet 不是真正不可变。那为什么不直接把 HashMap 改成 ConcurrentHashMap？加了线程安全不就好了？**
+
+加 ConcurrentHashMap 治标，但破坏了 volatile 发布的语义。volatile + 不可变对象是最优组合（读无锁、写原子、无并发问题）。如果对象可变（即使是线程安全的 ConcurrentHashMap），volatile 只保证"引用切换的可见性"，不保证"对象内部状态的可见性"——一个线程读到新引用，但新引用内部的 ConcurrentHashMap 正被另一个线程修改，可能读到中间状态。正确做法是让 CompiledRuleSet 真正不可变——把"可变的缓存"移出 CompiledRuleSet，放到外部的 ThreadLocal 或 RequestScope（每请求一个缓存实例），CompiledRuleSet 只存"编译后的不可变规则数据"。这样 volatile 发布的对象是真不可变，读完全无锁且安全。ConcurrentHashMap 是兜底方案（如果改不动 CompiledRuleSet），但不是最优。
+
+### 第四层：方案权衡
+
+**Q：你把 CompiledRuleSet 改成真正不可变（缓存移到外部），volatile 发布生效。但业务说有些规则需要"运行时更新统计"（如规则命中计数），这些统计数据天生可变，怎么办？**
+
+统计数据和规则数据要分离。规则数据（CompiledRuleSet）是"决策逻辑"，不可变，用 volatile 发布。统计数据（命中计数）是"运行时聚合"，可变，用独立的并发结构（如 AtomicLong 或 LongAdder 按 ruleId 维度）。两者分离——CompiledRuleSet 里只存规则逻辑（不可变），统计放在外部的 `ConcurrentHashMap<String, LongAdder> ruleHitCount`。规则切换时，ruleSet 引用替换（volatile），但 ruleHitCount 不变（历史统计保留）。代价是两个数据结构（规则 + 统计），要分别管理，但语义清晰——不可变的归 volatile 发布、可变的归并发结构。这样既保证了 volatile 发布的正确性，又支持了运行时统计。
+
+**Q：为什么不直接用 AtomicReference<CompiledRuleSet> 替代 volatile？AtomicReference 内部也是 volatile，还提供 CAS 操作，更强大。**
+
+功能上 AtomicReference 能替代 volatile（它内部就是 volatile field + CAS），但这里有过度设计。我们的场景是"单线程写（reload 由单线程执行）、多线程读"，写是简单的引用替换（`this.ruleSet = newSet`），不需要 CAS（没有多个线程并发写的竞争）。AtomicReference 的 CAS 价值在"多线程并发写且需要原子条件更新"（如 `compareAndSet(old, new)`），这里没有这个需求。用 volatile 更轻量（一个字段修饰符 vs 一个 Atomic 对象）、代码更直观（`this.ruleSet = newSet` vs `ref.set(newSet)`）。AtomicReference 适合需要 CAS 的场景（如无锁队列、状态机），单纯的引用发布用 volatile 足够。选工具要匹配场景，不是"更强大"就更好。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么验证 volatile 的规则热加载真的对所有线程可见、且对象状态一致？并发 bug 难复现，怎么测？**
+
+并发测试 + 运行时校验：
+1. 压力测试模拟——开 100 个线程持续调 evaluate（每秒几万次），同时 1 个线程反复 reloadRules（每 100ms 一次，换不同版本）。跑 10 分钟，每次 evaluate 校验"拿到的 ruleSet 版本 vs 此时应该的版本"（通过 reload 的日志时间戳对比）。如果有线程读到"构造中的半初始化对象"（NPE 或字段为 null），说明 volatile/不可变性有问题。jcstress（Java Concurrency Stress tests）是专门的并发测试工具，能复现极低概率的并发 bug。
+2. 运行时不变量校验——在 evaluate 方法里加断言（生产可关），校验 CompiledRuleSet 的内部状态（如 rules map 的 size == 预期、version 字段匹配）。如果读到不一致状态，断言失败上报。
+3. 内存屏障验证（进阶）——用 JIT Watch 看 evaluate 方法的汇编，确认 volatile 读后插入了 LoadLoad 屏障（x86 上可能是 `lock add` 指令）。这验证了 JVM 确实生成了正确的屏障指令。
+
+**Q：怎么让团队的并发代码不踩 volatile/JMM 的坑？**
+
+沉淀成规范和工具：
+1. 并发规范文档——明确 volatile 的适用场景（状态标志、单次发布引用）和禁忌（计数器、复合操作）。单例必须用 volatile（DCL）或静态内部类，禁止裸 DCL。
+2. 静态检查——用 SpotBugs / ErrorProne 检测"双重检查单例未加 volatile"、"volatile 字段做复合操作（i++）"等模式，CI 强制。
+3. 并发测试要求——所有涉及共享状态的代码必须附并发测试（jcstress 或多线程压测），证明线程安全。CR 时 review 共享变量的可见性/有序性保障。
+4. 不可变性规范——volatile 发布的对象必须真正不可变（所有字段 final、无修改方法）。CR 检查 volatile 引用指向的对象是否有 setter 或可变集合。
+5. 故障复盘——把这次"CompiledRuleSet 内部 HashMap 可变导致并发读不一致"的代码、测试复现、不可变性重构存知识库，作为"volatile 发布要求对象不可变"的案例。

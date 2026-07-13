@@ -255,3 +255,66 @@ public List<Event> queryEvents(String uid, int limit) {
     return events;
 }
 ```
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：风控决策服务堆配了 8G，你却坚持开 `-XX:+HeapDumpOnOutOfMemoryError`。dump 文件 8G 会占满磁盘且 dump 过程停服几秒，为什么一定要开？决策依据是什么？**
+
+因为 OOM 是"必抓现场"的故障——如果不 dump，OOM 重启后现场消失，下次还会 OOM，且无法定位根因。dump 的代价（几秒停顿 + 8G 磁盘）是"一次性"的，但不 dump 的代价是"反复 OOM + 永远查不清"。我们用 `-XX:HeapDumpPath=/data/dumps/` 指向独立挂载的大磁盘（100G），并配 cron 定时清理 7 天前的 dump（避免占满）。8G 堆的 dump 停顿实测 5-10 秒（G1 的 dump 会触发 Full GC），对风控决策服务意味着这几秒请求超时，但服务本来已经 OOM 要重启了，多停 10 秒可接受。决策依据是 ROI——不开 dump 的"反复 OOM 损失"（每次 OOM 影响几分钟、可能多次）远大于开 dump 的"一次性停顿"。核心服务必须开，非核心（如离线任务）可选。
+
+### 第二层：证据与定位
+
+**Q：风控决策服务 OOM 了，但运维说 dump 文件没生成（磁盘上没有 hprof）。你怎么定位 OOM 类型？没有 dump 怎么分析？**
+
+先看 OOM 的异常信息（应用日志里会有 `java.lang.OutOfMemoryError: xxx`），不同信息决定不同排查路径：
+1. `Java heap space` 或 `GC overhead limit exceeded`——堆 OOM。没 dump 时，用 jstat 看历史（如果有 JMX/Prometheus 持续采集的 `jvm_memory_used_bytes` 曲线，看堆增长趋势——是缓慢增长（泄漏）还是瞬间飙高（大对象/大结果集））。下次重启前先手动 `jmap -dump:format=b,file=heap.hprof <pid>` 主动 dump（在堆高但还没 OOM 时）。
+2. `Metaspace`——元空间 OOM，dump 堆没用（元空间不在堆里）。用 `jcmd <pid> GC.class_stats` 看类统计，或 arthas 的 `classloader` 命令看加载了多少 Class、哪些 ClassLoader 加载最多。常见是 CGLIB/反射动态生成 Class 没复用。
+3. `Direct buffer memory`——直接内存 OOM，堆 dump 看不到。用 `jcmd <pid> VM.native_memory` 看本地内存分布，或查 Netty 的 `PooledByteBufAllocator` 指标。
+4. `unable to create new native thread`——线程 OOM，`jstack <pid> | wc -l` 看线程数，`jstack` 看是什么线程爆炸（如 Tomcat、Dubbo、自建线程池）。
+没 dump 时，事后靠 Prometheus 的历史曲线（堆/元空间/线程数随时间变化）+ 日志推断，比有 dump 难，所以要确保下次能 dump。
+
+### 第三层：根因深挖
+
+**Q：你拿到 dump，MAT 的 Dominator Tree 显示 FeatureCache 占了 6G（堆的 75%）。根因是缓存泄漏，但这个缓存用了 Caffeine（有 maximumSize=100万）。为什么还会泄漏？**
+
+Caffeine 的 maximumSize 是"近似上限"（异步维护，可能短暂超），不会无限增长。如果 dump 显示 FeatureCache 有 5000 万条（远超 100 万上限），说明 maximumSize 没生效。几种可能：
+1. 配置没生效——可能配置类没加载、或被覆盖。用 arthas ognl `@com.ant.risk.FeatureCache@CACHE` 看 CACHE 对象的实际配置（Caffeine 的 maximumSize 字段），确认值是 100 万还是被覆盖成无上限。
+2. Key 不可达但 Value 持引用——Caffeine 按 key 淘汰，但如果 Value 持有 key 的强引用（如 Value 是一个包含 key 的对象图），且这个 Value 被外部 GC Root 持有，Caffeine 淘汰 key 后 Value 仍被外部引用无法回收。看 MAT 的 GC Root 引用链，确认 Feature 对象是被谁持有的。
+3. 不是同一个缓存——可能 FeatureCache 有多个实例（如每个租户一个 Caffeine 实例，10000 个租户 × 100 万 = 100 亿），总量爆炸。看 dump 里 Caffeine 实例数。
+真实案例常见是第 3 种——多租户场景每租户独立 Caffeine，单实例上限 100 万，但租户数 5000，总上限 50 亿。根因是"缓存隔离粒度太细"，应改为共享缓存（key 加租户前缀）+ 全局上限。
+
+**Q：根因是多租户缓存实例爆炸。那为什么不直接调小单租户的 maximumSize？比如从 100 万调到 1 万？**
+
+调小单租户上限会牺牲命中率。1 万的上限对大租户（百万用户）意味着 99% 未命中，风控决策要回源查 HBase（30ms），RT 从 5ms 涨到 30ms，P99 超标。根因不是"单租户上限大"，是"缓存架构没做全局控制"。正确做法是共享缓存（一个 Caffeine 实例，key = tenantId + uid，全局 maximumSize=500 万），让所有租户竞争同一个池，热点租户（大租户）自然占更多空间（Caffeine 的 W-TinyLFU 是频率敏感的，热 key 留得住），冷租户少占。这样全局上限可控（500 万 × 1KB = 5G），且命中率比"每租户 1 万"高（热的租户能拿到更多空间）。调小单租户上限是局部优化，改架构是全局优化。
+
+### 第四层：方案权衡
+
+**Q：你改成了共享缓存（全局 500 万上限），但业务说大租户抱怨"缓存老 miss"（小租户把空间占了）。怎么权衡大小租户的缓存公平性？**
+
+这是缓存公平性权衡。W-TinyLFU 本身对热的 key 友好（大租户的热用户能留住），但大租户的"温用户"（访问频率中等）可能被小租户的高频垃圾请求挤出。权衡方案是"保留份额 + 共享池"——给每个租户一个"保底配额"（如每租户保底 1 万条，确保基本命中率），超出部分进共享池竞争。Caffeine 不直接支持这个，可以用"多级缓存"模拟——每租户一个小 Caffeine（1 万） + 全局一个大 Caffeine（400 万），查询时先查租户级再查全局。代价是两次查询（但都纳秒级，可忽略）+ 复杂度上升。另一种简化是给大租户单独的缓存实例（Top 100 大租户各一个 Caffeine 100 万），小租户共享一个 400 万的，按租户价值分配资源。风控选了后者——大租户是收入主力，值得独立缓存；小租户共享，miss 率高但单笔影响小。
+
+**Q：为什么不直接换 Redis 做缓存？Redis 内存大（几百 G），不用纠结 500 万还是 1 亿上限，还天然支持租户隔离（key 前缀）。**
+
+Redis 确实容量大，但延迟高。风控决策查缓存的 RT 预算是 5ms（本地 Caffeine 0.1ms），Redis 单次 get 走网络 1-3ms（P99 可能 10ms+），且 Redis 抖动（主从切换、慢查询）会让 P99 飙到 50ms。对 P99 <50ms 的决策链路，Redis 的延迟和抖动不可接受。Caffeine 的本地内存是纳秒级访问、无网络依赖、无抖动。Redis 的角色是"Caffeine 未命中时的二级回源"（替代 HBase），不是 Caffeine 的替代。容量和延迟是两个维度——Caffeine 小而快（热数据）、Redis 大而中（温数据）、HBase 大而慢（冷数据）。三层配合，单层都不够。纠结上限是因为"用有限的本地内存最大化命中率"，Redis 解决不了本地内存的延迟问题。
+
+### 第五层：验证与沉淀
+
+**Q：你修复了缓存泄漏，怎么证明 OOM 不会再发生？怎么验证内存稳定（不泄漏）？**
+
+内存稳定性验证（持续观察 + 压测）：
+1. 堆内存趋势——上线后用 Prometheus 看 `jvm_memory_used_bytes{area="heap"}` 的 7 天曲线。正常应该是"锯齿状"（GC 回收后下降、分配后上升），老年代占用稳定（不单调增长）。如果老年代单调增长（每次 GC 后基线缓慢上升），仍有泄漏。用 `jstat -gcutil <pid> 60000` 每分钟采样，看 OU（老年代使用率）趋势。
+2. 压测验证——用 JMeter 压 2 倍峰值 QPS 持续 2 小时，观察堆内存是否稳定（波动但不超过 70%）。如果 2 小时后堆持续增长到 OOM，是泄漏（压测加速暴露）。
+3. 缓存命中率——Caffeine 的 `cache.hit.rate` 应稳定（如 85%+），如果命中率持续下降（从 90% 降到 50%），可能是缓存被挤出（配额问题）或 key 分布变化。
+
+**Q：怎么让团队所有缓存都安全、不再泄漏？**
+
+沉淀成规范和工具：
+1. 缓存使用规范——禁止裸用 HashMap/ConcurrentHashMap 做缓存（必须用 Caffeine/Guava Cache 且必须配 maximumSize + expireAfterWrite）。Code Review 强制检查，ArchUnit 写规则测试。
+2. 缓存注册制——所有缓存实例必须注册到一个 CacheManager（统一配额、统一监控），禁止各模块自己 new Caffeine。CacheManager 统计总缓存大小，超全局阈值告警。
+3. 监控基线——每个缓存的 size、hit rate、eviction count 上报 Prometheus。size 接近 maximumSize 告警（配额不足）、hit rate 低于阈值告警（缓存效果差）、eviction rate 飙升告警（可能被异常流量冲）。
+4. ThreadLocal/resource 规范——所有 ThreadLocal 必须 try-finally remove（SpotBugs 检测）、所有 IO 必须 try-with-resources、所有监听器注册必须有对应 unregister。
+5. 故障复盘——把这次"多租户缓存实例爆炸 → 6G 泄漏 → OOM"的 MAT Dominator Tree 截图、缓存架构改进存知识库，作为"缓存必须全局配额"的案例。

@@ -139,3 +139,53 @@ OOM 本质是**"某内存区域无界增长耗尽"**——预防靠淘汰策略+
 1. **内存泄漏 vs 内存溢出**？——泄漏是对象不释放（堆慢慢长），溢出是瞬间撑爆。
 2. **WeakReference/SoftReference 区别**？——Weak 下次 GC 必回收，Soft 内存不足才回收（适合缓存）。
 3. **怎么在线排查**？——arthas（dashboard/heapdump/jad）或 jmap + MAT。
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：内容服务 OOM 之前，你为什么强调"保留现场"比"赶紧重启恢复"更重要？**
+
+OOM 的复现成本极高——内存泄漏是"慢累积"过程，可能跑几天才爆一次，重启后现场全没，下次还得等几天。而保留现场（HeapDump）的成本只是一次 dump（8G 堆约 30s STW + 几 GB 磁盘），换的是"能定位根因彻底解决"的机会。生产实践是 `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/data/dump/`——OOM 发生时 JVM 自动 dump 再退出，相当于"黑匣子"。如果不配这个参数，OOM 重启后等于每次都从零开始猜，永远治标不治本。拼多多评价/Feed 这种高频写入服务，OOM 复现窗口短（流量大累积快），现场更珍贵。
+
+### 第二层：证据与定位
+
+**Q：评价服务堆 OOM，dump 文件 6GB，你怎么在 6GB 里找到"是谁泄漏的"，而不是淹没在对象里？**
+
+直接看 Histogram 会看到几百万个对象，没用。正确的定位链路：
+1. MAT 打开 → 先看 "Leak Suspects" 报告（MAT 自动分析嫌疑），它会给 Top 级别的 GC Root 引用链。
+2. 看 "Dominator Tree"（支配树）——按" retained size"（保留大小，即这个对象被回收能释放多少）排序，Top1 往往就是元凶。如果 Top1 是 `ConcurrentHashMap$Node` 占了 4GB，说明有个 Map 在无限增长。
+3. 右键 → "Path to GC Roots" → "exclude weak/soft references"——看这个 Map 是被谁持有的，比如 `ReviewCache.map`（评价缓存）就是泄漏点。
+4. 如果是 ThreadLocal 泄漏，看 `ThreadLocal$ThreadLocalMap` 的 value，再追溯是哪个线程（线程名在 `Thread` 对象里）。
+
+### 第三层：根因深挖
+
+**Q：你定位到是评价缓存 `Map<Long, Review>` 泄漏（无限增长）。但代码里有淘汰逻辑，为什么还泄漏？**
+
+常见根因三类：
+1. **淘汰逻辑没生效**——比如用 `ConcurrentHashMap` 配合一个定时清理任务，但定时任务挂了（线程池 shutdown 了没重启），缓存只进不出。
+2. **Key 设计问题**——Key 用的是 `reviewId`，但 reviewId 是自增的，每条新评价都是新 Key，缓存存了全量历史评价。淘汰应该基于"访问时间"（LRU）而不是"数量上限"。
+3. **reviewId 永不变但内容变**——缓存的是 Review 对象的引用，业务每次更新 Review 直接改对象字段，缓存"看似没涨"但对象内部引用了大 List（图片列表/评论树）。
+根治：换 Caffeine（`maximumSize(100_000).expireAfterWrite(10, MINUTES)`），它内置 W-TinyLFU 淘汰策略，既能限数量又能淘汰冷数据。
+
+### 第四层：方案权衡
+
+**Q：你给评价缓存加了 Caffeine 上限，但业务说"缓存命中率从 90% 掉到 70%，热门商品评价读慢了"。你怎么办？**
+
+这是典型的"用空间换命中率"冲突。分层解：
+1. 先量化——命中率 90%→70% 时，评价查询 P99 从 5ms 涨到多少？如果只涨到 20ms，用户无感，可接受（换来了不 OOM）。
+2. 如果确实影响，调 Caffeine 参数——`maximumSize` 从 10 万调到 50 万（评估内存预算：50 万 × 2KB/Review ≈ 1GB，堆够就加），命中率能回到 85%。
+3. 加多级缓存——Caffeine（本地，挡热点）+ Redis（分布式，挡全量）。Caffeine 只存 Top 1 万热门商品的评价（用 Caffeine 的 `maximumSize` + 手动预热），Redis 存全量 + TTL。
+4. 用 W-TinyLFU 优势——Caffeine 默认就是 W-TinyLFU，它对"突发访问 + 长尾"的命中率比传统 LRU 高 30%，所以同样的容量，Caffeine 比 Guava Cache 命中率高。
+
+### 第五层：验证与沉淀
+
+**Q：Metaspace OOM 你只把 MaxMetaspaceSize 从 256m 调到 512m，怎么确认是"真需要这么多"还是"泄漏没解决只是延缓"？**
+
+Metaspace OOM 八成是动态类生成泄漏（CGLIB/Groovy/反射），调大只是延缓。验证是否真解决：
+1. 看 Metaspace 增长曲线——`arthas dashboard` 或 Prometheus 的 `jvm_memory_used_bytes{area="nonheap"}` 看 Metaspace 占用。如果调到 512m 后曲线仍在单调上涨（几天从 300m 涨到 500m），说明泄漏还在，只是没到阈值，迟早再 OOM。
+2. 看类数量——`arthas classloader` 或 `jmap -clstats`，看加载的类总数是否单调增。正常服务稳定后类数应该持平（几万），如果持续涨到几十万，是动态代理类没复用。
+3. 定位泄漏源——`arthas jad` 反编译生成的代理类看命名（`$$EnhancerByCGLIB$$` / `_$$_javassist`），再 grep 代码找 `Enhancer.create()` 或 `Proxy.newProxyInstance()` 在循环里被调用的地方。
+沉淀：所有 `Map` 缓存必须用 Caffeine 并设 `maximumSize`（Sonar 规则）；Metaspace 监控阈值（占用 >80% 告警）；动态代理类必须复用（封装工厂缓存 Enhancer 实例）。

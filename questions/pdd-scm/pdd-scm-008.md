@@ -128,3 +128,76 @@ producer.commitTransaction();  // 两个 topic 同时成功/失败
 1. **acks=0/1/all 区别**？——0 不等确认（最快可能丢）、1 等 leader（leader 挂丢）、all 等所有同步副本（最安全）。
 2. **怎么保证消息顺序**？——单 partition 有序；多 partition 用相同 key 保证同 key 进同 partition。
 3. **Kafka 为什么快**？——顺序写磁盘 + 零拷贝（sendfile）+ 批量压缩 + 分区并行。
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：订单服务下单后要通过 Kafka 通知库存/物流/结算三个下游。为什么用 Kafka 而不是直接 RPC 调用三个服务？**
+
+三个动机：
+1. **解耦**——RPC 调用是同步的，订单服务要等三个下游都返回才响应，任意一个慢（物流接口超时）就拖垮下单。Kafka 异步，订单发完消息立即返回，下游各自消费。
+2. **削峰**——大促 QPS 暴涨，下游（如结算做复杂对账）处理慢，Kafka 做缓冲，下游按自己的速度消费，不被压垮。
+3. **扩展**——新增下游（如风控）只要订阅 topic，不用改订单服务代码。RPC 的话每加一个下游要改订单服务的调用链。
+代价是引入最终一致（秒级延迟），但订单场景容忍。
+
+### 第二层：证据与定位
+
+**Q：库存服务反馈"没收到某笔订单的扣减消息"，你怎么定位是生产端没发、Broker 丢了，还是消费端漏消费？**
+
+三段排查：
+1. **生产端**——查订单服务的日志，搜 `producer.send(order-created, orderId=xxx)`，确认 send 返回了 `RecordMetadata`（有 offset 和 partition）。如果没日志或抛异常，是生产端没发成功；看 `producer-metrics` 的 `record-error-rate`。
+2. **Broker**——`kafka-console-consumer --topic order-created --partition X --offset Y --max-messages 1`，按 orderId 找消息（或按 timestamp `--from-beginning | grep orderId`）。如果 Broker 上没有，是生产端丢了（可能 acks 配置错）；如果有，问题在消费端。
+3. **消费端**——看消费者的 `consumer_lag` 和 commit offset。`kafka-consumer-groups --describe --group stock-group`，如果 OFFSET 跳过了这条消息（比如手动 commit 时 `commitSync` 了整批但中间这条处理抛异常被 catch 吞了），就是消费端漏处理。
+
+### 第三层：根因深挖
+
+**Q：你发现消费端的 offset 已经提交，但库存没扣（业务没执行）。根因是什么？**
+
+根因是"处理失败但 offset 仍提交"，典型坑：
+1. **异常被吞**——消费循环里 `try { process(record); } catch (Exception e) { log.error(...); }`，`process` 抛异常后 catch 住，循环继续，最后 `commitSync()` 提交了包括失败消息的 offset，消息丢失。
+2. **异步处理未等待**——`process` 是异步的（`CompletableFuture.supplyAsync`），主循环没等它完成就 commit，异步任务失败但 offset 已提交。
+根因不是 Kafka 的问题，是消费代码的"先 commit 后处理 / 吞异常"模式。正确做法：处理失败不 commit（抛异常让 consumer 重投递）+ 死信队列（DLC）兜底重试上限的消息。
+
+**Q：那为什么不直接关闭自动提交、处理失败就阻塞重试到成功为止？**
+
+阻塞重试会引发"消息毒丸"问题：
+1. **毒丸阻塞**——如果某条消息因为脏数据永远处理失败（如 orderId 为 null），无限重试会卡住整个 partition 的消费，后续消息全部积压。
+2. **雪崩**——重试时占着消费者线程，新消息消费不动，consumer_lag 暴涨。
+正确做法是"有限重试 + 死信"：本地重试 3 次（间隔递增 1s/5s/30s），仍失败就发到 `order-created-dlq` topic，主流程继续消费下一条。死信 topic 有人工/定时任务处理。拼多多订单消费就是这套，DLQ 里的消息每天约 0.01% 量级，值班人工补偿。
+
+### 第四层：方案权衡
+
+**Q：你用本地重试 + DLQ，但有些消息要求严格顺序（同一订单的"创建→支付→发货"必须按序处理），怎么保证？**
+
+顺序消费和并行吞吐是矛盾的。两种方案：
+1. **单 partition + key 路由**——把 orderId 作为消息 key，Kafka 保证同 key 进同 partition，partition 内有序。消费者对单 partition 单线程消费，保证顺序。代价是吞吐受限于单 partition（同订单的事件串行，但不同订单可并行）。
+2. **用 RocketMQ 的顺序消息**——RocketMQ 原生支持 MessageQueueSelector，按 orderId 选 queue，消费端 `MessageListenerOrderly` 保证单 queue 串行。如果已用 Kafka 就用方案 1。
+**注意**：顺序消费 + 重试要小心——某条消息失败阻塞会卡住整个 partition 后续消息。所以顺序场景的重试要"快速失败 + 转 DLQ"，不能死等。
+
+**Q：为什么不直接用 Kafka 事务（transactional.id）保证跨 topic 的原子性，而要用本地消息表 + MQ？**
+
+Kafka 事务和本地消息表解决不同问题：
+1. **Kafka 事务**——只保证"Kafka 内部多 partition 的原子写"（要么都成功要么都失败），管不到 MySQL。如果业务是"写 MySQL + 发 Kafka"，Kafka 事务管不了 MySQL，MySQL 提交了 Kafka 回滚，数据不一致。
+2. **本地消息表**——把"业务数据 + 待发消息"写在同一个 MySQL 事务（outbox 表），本地事务保证原子。定时任务扫 outbox 发 Kafka，发成功删除。这是"跨系统最终一致"的标准解法。
+所以下单扣库存场景必须用本地消息表（MySQL + Kafka 跨系统），Kafka 事务只适合纯 Kafka 链路（如流处理 sink 到多 topic）。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么证明 Kafka 链路的消息不丢不重真的生效？**
+
+四个监控指标：
+1. **生产端**——`producer.record-error-rate` = 0、`record-retry-rate` < 阈值，JMX 采集。
+2. **Broker**——`under-replicated-partitions` = 0（ISR 副本都健康）、`offline-partitions` = 0。
+3. **消费端**——`consumer_lag` 稳定不暴涨（< 1000），`commit-offset` 和 `log-end-offset` 差距可控。
+4. **业务对账**——每天跑对账：`count(订单表) = count(库存扣减记录) = count(Kafka topic 消息)`，三者相等证明没丢没重。拼多多每天凌晨跑这道对账，差异 > 0.001% 告警。
+
+**Q：怎么让团队的 Kafka 消费代码不踩"吞异常 / 毒丸 / 重复消费"的坑？**
+
+沉淀消费框架：
+1. **统一消费模板**——封装 `SafeKafkaConsumer`，内置"本地重试 3 次 + DLQ + 幂等校验 + 手动 commit"，业务方只实现 `process()` 方法，不能自己写消费循环。
+2. **幂等 SDK**——`@Idempotent(key = "orderId", ttl = 86400)` 注解，自动 Redis SETNX 去重，业务方加注解即生效。
+3. **Code Review 规则**——任何 `consumer.poll` 后的 for 循环必须有 try-catch 转 DLQ 逻辑，裸 `commitSync()` 不允许；SonarQube 扫 `catch (Exception` 后无 throw 的吞异常代码报 critical。
+

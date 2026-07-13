@@ -221,3 +221,49 @@ CREATE TABLE task_instance (
 1. **怎么保证任务幂等**？——任务设计成"覆盖写"而非"追加"，用任务实例 ID 做去重，关键步骤加分布式锁。
 2. **环形依赖怎么处理**？——DAG 不允许环，构建时检测（拓扑排序能完成则无环），环要拆成多个 DAG 或加状态机。
 3. **大 DAG 性能问题**？——Airflow Scheduler 是单点，万级任务要分 Scheduler（CeleryExecutor + 多 worker），或换 Argo/K8s 原生。
+
+## 苏格拉底式面试追问
+
+> 这组追问不背答案，模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：你们的模型训练流水线为什么用 Airflow 而不是用 Argo Workflows？Argo 是 K8s 原生的，你们训练任务都跑在 K8s 上，不是更顺吗？**
+
+历史和生态原因。Airflow 在我们引入时（2020 年）生态最成熟——Python DAG 灵活（算法同学会 Python）、Operator 丰富（SparkSubmitOperator、EmailOperator、SlackOperator）、UI 成熟、社区大。Argo 当时还偏新，文档少。现在 Argo 确实更适合 K8s 原生场景（YAML 声明、Pod 级别调度、GPU 资源直接用 K8s 的 device plugin），但迁移成本高——我们有上千个 DAG，全部从 Python 翻译成 YAML 工作量巨大，而且 Airflow 的 Python DAG 里有很多复杂逻辑（条件分支、XCom 传参、动态生成 task），Argo 的 YAML 表达这些更繁琐。折中方案：新项目用 Argo（K8s 原生优势明显），老项目维持 Airflow，通过 Webhook 互调（Airflow 的 DAG 完成后触发 Argo Workflow）。
+
+### 第二层：证据与定位
+
+**Q：一个模型训练流水线（extract→features→train→evaluate→deploy）跑到 train 步骤时 hung 住了 30 分钟没动。你怎么排查是任务卡死还是在等资源？**
+
+分三步。第一，看 Airflow UI 的 Task Instance 详情——`Task State` 如果是 `running`，看 `Duration` 是否异常长；点进 `Log` 看 K8s Pod 的日志，如果日志最后一条是 `Loading checkpoint...` 然后没下文，是任务真的在跑（可能是数据加载慢）。如果日志停在 `Scheduling pod...`，是 K8s 调度器没分配到 GPU（集群满载）。第二，`kubectl get pods -n airflow | grep <task-id>` 看 Pod 状态——如果 `Pending`，是资源不足（`kubectl describe pod` 看 Events，会写 `Insufficient nvidia.com/gpu`）；如果 `Running` 但 CPU/GPU 利用率 0（看 Prometheus），是训练进程死锁了（NCCL 等待超时但没报错）。第三，看 Airflow Scheduler 日志——如果 Scheduler 本身 hang 了（单点问题），所有 Task Instance 都会卡，不只这一个。
+
+### 第三层：根因深挖
+
+**Q：你定位到是 train Pod 一直 Pending，`kubectl describe` 显示 `Insufficient nvidia.com/gpu`。集群明明有 100 张 GPU，为什么分配不到？**
+
+根因可能是三个。第一，拓扑约束——训练任务要 8 卡 NVLink 互联（`nodeSelector: accelerator=nvidia-a100 + hostIPC: true`），集群有 100 张卡但分布在不同节点，满足"单节点 8 卡"的节点只有 10 个且都被占满了。第二，优先级被抢占——高优先级的在线推理 Pod 抢走了 GPU，训练任务（低优）被 evict 或调度不上去。看 `kubectl get events` 有没有 `Preempted` 事件。第三，GPU 资源碎片化——K8s 默认调度器不做 GPU bin-packing，如果一个节点上 8 张卡被 8 个单卡 Pod 各占 1 张，剩 0 张整块可用，8 卡训练任务调度不上去。解法：用 Volcano/KubeBatch 的 Gang Scheduling（全部 8 卡资源就绪才启动，避免部分启动后死等），或定期清理僵尸 Pod 释放碎片。
+
+**Q：那为什么不直接给训练任务高优先级，让它能抢占推理任务的 GPU？训练可是离线的，不影响线上。**
+
+这是在线/离线混部的核心矛盾。训练任务时长通常几小时到几天，如果给它高优先级抢占推理 Pod，推理 Pod 被 evict 后要重新加载模型（分钟级冷启动），线上 P99 延迟飙升，影响真实用户。正确做法是"时间错峰 + 弹性抢占"：白天（流量高峰）训练任务低优先级，只填推理的空闲 GPU；夜间（流量低谷）训练任务提升优先级，批量跑。我们的策略是给训练任务配 `priorityClassName: training-night`（白天低优）和 `training-batch`（夜间中优），配合 CronJob 在 23:00 自动切换优先级。极端情况下（紧急训练）手动提优先级，但要走审批 + 通知值班。混部的关键是"不为了离线效率牺牲在线 SLA"。
+
+### 第四层：方案权衡
+
+**Q：你们用 Airflow 的 retries=3 + 指数退避做容错。但如果 train 步骤在第 2 次重试时成功了，第 1 次重试的副作用（比如写了部分 checkpoint）怎么处理？**
+
+这取决于任务是否幂等。如果 train 步骤每次都从头读数据、覆盖写 checkpoint（`torch.save` 覆盖同名文件），重试没有副作用，自然幂等。但如果 checkpoint 是追加写（`append` 模式）或中间结果写到分布式存储没清理，重试会产生脏数据。规范要求：第一，所有 DAG 任务的输出必须覆盖写（`OUTPUT_DIR` 每次启动先 `rm -rf` 清空），保证重试幂等。第二，任务实例 ID（`run_id + task_id + try_number`）作为输出路径的一部分（`/output/{dag_id}/{run_id}/{task_id}/try_{try_number}/`），重试不会覆盖前次，事后可审计。第三，跨任务的依赖用 Airflow 的 XCom 或外部存储（S3/HDFS）传参，不用本地文件（本地文件在 Pod 重启后丢失）。
+
+**Q：为什么不直接用 Temporal？Temporal 有强一致的状态持久化，重试/补偿/长事务都原生支持，比 Airflow 的 retries 强多了。**
+
+Temporal 确实更强（workflow 状态持久化、activity 重试可配置、长流程支持好），但它偏"业务流程编排"（订单/审批/支付），对"数据/ML 流水线"的场景支持不如 Airflow。Airflow 有 SparkSubmitOperator、HiveOperator、S3Sensor 这些开箱即用的数据生态 Operator，Temporal 要自己写 Activity 适配。而且 Temporal Server 本身要部署（Temporal Cluster + 数据库），运维成本高于 Airflow（Airflow 一个 Scheduler + PostgreSQL 就能起）。选型看场景：数据/ML 流水线用 Airflow，业务长流程用 Temporal，不要强求统一。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么证明训练流水线的容错机制真的能在 Pod 挂掉时恢复？平时不挂的时候根本验证不了。**
+
+混沌注入。第一，定期（每周一次）在生产流水线里注入故障——用 Chaos Mesh 故意 kill 掉 train 步骤的 Pod（`pod-kill` action），看 Airflow 是否在 retries 内恢复。如果 retries 用尽仍失败，说明容错机制有漏洞。第二，注入网络分区——让某个 worker Pod 网络隔离 60 秒（`network-partition`），看 NCCL 是否 timeout 检测到 + 触发重试。第三，注入慢节点——用 StressNG 让某个 Pod 的 CPU 满 100%（模拟资源争抢），看任务 timeout 是否触发。这些注入要在非关键流水线上跑（或影子环境），记录"故障注入到恢复"的 MTTR（平均恢复时间），目标 < 10 分钟。
+
+**Q：怎么让团队不再写出"重试有副作用"的 DAG？**
+
+两条规范。第一，DAG 编写规范——强制所有任务输出走"覆盖写 + 任务实例 ID 路径"，禁止追加写本地文件。CI 里检查 DAG 代码是否有 `open(..., 'a')` 或 `os.path.join(local_dir, ...)` 这种模式。第二，DAG 模板——提供 `@task(idempotent=True)` 装饰器，自动在任务启动时清空 `try_number` 对应的输出目录，强制幂等。算法同学写 DAG 时继承模板，不能裸写。第三，DAG Code Review checklist——"输出是否幂等""重试是否安全""超时是否设置""依赖是否用 XCom 而非本地文件"，四项检查不过 review 打回。

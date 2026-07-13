@@ -146,3 +146,60 @@ public boolean deduct(long qty) {
 1. **synchronized 锁的是什么**？——实例方法锁 this，静态方法锁 Class 对象，代码块锁括号内对象。
 2. **为什么 JDK 15 禁用偏向锁**？——现代应用多线程化，偏向收益小；撤销需 STW 影响性能；维护代码复杂。
 3. **synchronized 和 volatile 区别**？——synchronized 保证原子性+可见性+有序性；volatile 只保证可见性+有序性，不保证原子性。
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：供应链的库存扣减场景，你为什么用 synchronized 而不是直接上 Redis 分布式锁？**
+
+要分单机和跨机看。仓库 W1 的本地库存计数（`stock` 字段）只在本 JVM 内被多线程扣减，用 synchronized 保护就够了，代价是几次 CAS 自旋；如果都上 Redis 分布式锁，单次扣减多一次 Redis RTT（1-3ms），大促 QPS 上万时锁服务本身成瓶颈。跨机的全局库存（多仓共享）才用 Redis Lua 扣减。决策依据是"锁的竞争域"——竞争在同一 JVM 内就用 JVM 锁，跨 JVM 才上分布式锁。
+
+### 第二层：证据与定位
+
+**Q：大促时单机库存扣减接口 P99 从 5ms 飙到 200ms，你怎么确认是 synchronized 锁竞争导致的？**
+
+三步证据链：
+1. `arthas thread -n 5` 看占用 CPU/阻塞最高的线程——如果大量线程状态是 `BLOCKED`，且堆栈停在 `StockService.deduct`，锁定锁竞争。
+2. `arthas thread -b` 直接找"阻塞最多线程的锁"——它会打印出哪个对象头是瓶颈锁（`-...- a java.lang.Object` 持有者 xxx）。
+3. `jstack <pid>` 连续打 3 次，看 BLOCKED 线程数——如果从平时 0 涨到 50+，且都卡在 monitorenter，坐实是 synchronized 重量级锁膨胀。
+
+### 第三层：根因深挖
+
+**Q：你看到 jstack 里 50 个线程 BLOCKED 在 monitorenter，但为什么 synchronized 会膨胀成重量级锁？根因是什么？**
+
+看 Mark Word 确认锁状态。`jol`（Java Object Layout）打印对象头，如果 mark word 末两位是 `10`，就是重量级锁。膨胀的根因是 CAS 自旋失败到阈值（默认自适应，约 10 次）。在库存场景，大促时同一商品（同一 `stock` 对象）被几十个线程同时扣减，自旋基本都失败，膨胀成 OS Mutex，线程 `park` 进 `ObjectMonitor` 的 `_EntryList`，每次唤醒要 user→kernel 切换（约 1-3μs），50 个线程排队就是毫秒级延迟。
+
+**Q：那为什么不直接把 synchronized 换成 ReentrantLock 就能解决？**
+
+换 ReentrantLock 不解决根本问题——竞争强度不变，ReentrantLock 底层还是 AQS（`state` CAS 失败进 CLH 队列 park），高竞争下一样阻塞。真正治本是降低锁粒度：把"一个 `stock` 对象一把锁"改成"分段锁"——按 skuId 哈希到 16 个 `striped lock`（Guava `Striped<Lock>`），不同 SKU 各扣各的互不阻塞；或者干脆用 `AtomicLong.compareAndSet` 把 synchronized 去掉，让扣减变成无锁 CAS。
+
+### 第四层：方案权衡
+
+**Q：你用了 AtomicLong 的 CAS 替代 synchronized，但大促时 CPU 飙到 90%，为什么？怎么办？**
+
+CAS 在高竞争下会"活锁式自旋"——大量线程 `compareAndSet` 失败后空转重试，CPU 全烧在自旋上。解决办法是"消除竞争"而不是优化锁：
+1. **库存预热分桶**：把 skuId=1001 的库存 1000 拆成 10 桶（`slot_0` 到 `slot_9` 各 100），扣减时按线程 ID 取模选桶，把单点竞争分散 10 倍。
+2. **Redis Lua 原子扣减**：把热点 SKU 的扣减前移到 Redis（`EVAL` 一段 Lua 脚本判断+扣减原子），JVM 只做结果落库，彻底避开 JVM 锁。
+
+**Q：为什么不直接用 LongAdder？它不是专门解决高并发计数的吗？**
+
+LongAdder 解决的是"统计计数"（只增不减、最终一致），它的 `sum()` 不是强一致的（Cell 数组累加有窗口）。库存扣减要求"扣减后余量不能为负"的强一致判断，LongAdder 做不到——你 `sum()` 出来 100，两个线程同时判断 `>= 50` 都通过，扣完就超卖。所以库存场景必须用 AtomicLong 的 `compareAndSet`（带前置判断的 CAS），不能用 LongAdder。
+
+### 第五层：验证与沉淀
+
+**Q：你把 synchronized 改成分段锁 + CAS，怎么证明超卖真的没了、性能真的好了？**
+
+两个指标交叉验证：
+1. **超卖验证**：上线前埋点 `oversell_count`（扣减时 `stock < 0` 就 +1），上线后看这个计数器从日均 50+ 降到 0；同时跑压测脚本 100 并发各扣 10 次（总 1000），最终 `stock` 必须 = 0 而不是 -xx。
+2. **性能验证**：看 APM 的 `stock_deduct_p99`，从 200ms 降到 20ms；`arthas monitor StockService deduct success` 看成功率，从 95%（竞争失败重试）到 99.9%。
+
+**Q：怎么让团队以后不再误用 synchronized？**
+
+沉淀成机制：
+1. **SonarQube 规则**：对 `synchronized` 关键字加 code smell 告警，强制 review 时说明锁粒度和预估竞争强度。
+2. **并发规范文档**：明确"单机并发计数用 AtomicXxx，单机临界区用 synchronized 且锁对象必须细粒度（按业务 key 分段），跨机用 Redis Lua"。
+3. **压测准入**：涉及库存/扣减的接口，上线前必须过 500 并发压测，`arthas thread -b` 不能出现 BLOCKED 堆积。
+

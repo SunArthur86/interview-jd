@@ -118,3 +118,50 @@ executor.getRejectedExecutionCount();  // 拒绝数飙升→告警
 1. **线程池大小怎么定**？——CPU 密集 `N+1`，IO 密集 `2N`，最终靠压测调。
 2. **为什么用 CallerRuns**？——反压上游降速，比直接拒绝更稳。
 3. **怎么动态调参数**？——`executor.setCorePoolSize(n)` 运行时调（美团 DynamicTp 框架）。
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：评价写入和 Feed 流写入为什么要用两个独立线程池，而不是共用一个大池？共用不是更省资源吗？**
+
+省资源只是表象。共用池的致命问题是"慢任务饿死快任务"——评价写入要走 DB + ES 同步，单条 P99 在 200ms 以上；Feed 写入要做推/拉扩散到粉丝收件箱，是轻量 Redis 操作。共用池时一旦评价写入把核心线程占满，Feed 写入会被堆进队列，最终 Feed 出现在用户主页的延迟从 ms 级涨到秒级。独立池的本质是用"资源隔离"换"故障隔离"，符合拼多多"评价和 Feed 是两条独立业务链路"的诉求。
+
+### 第二层：证据与定位
+
+**Q：线上评价服务 P99 从 80ms 涨到 1.2s，你怎么确认是线程池问题，而不是 DB 慢或网络抖动？**
+
+三路证据交叉验证：
+1. 看 Prometheus 上 `review_write_executor_active_threads` 是否长期顶在 `corePoolSize=50`，且 `queue_size` 在 4000+（接近 5000 上限）——线程池打满的典型特征。
+2. 看 `review_write_executor_rejected_count` 是否在飙升——CallerRunsPolicy 触发意味着提交线程（Tomcat 工作线程）被拉去干活，反压到上游。
+3. 看 DB 侧 `review_insert_p99` 和 `es_bulk_p99` 是否正常——如果 DB/ES 都正常但应用线程池打满，问题在池容量或下游连接数，不是 DB。
+
+### 第三层：根因深挖
+
+**Q：你发现线程池打满了，但 QPS 没涨。根因可能是什么？**
+
+QPS 没涨但池打满，说明单任务执行时间变长了（吞吐 = 并发数 / 单任务耗时）。按这个思路追：
+1. `arthas trace ReviewWriteExecutor#submit` 看每步耗时——是 `reviewDao.insert` 变慢（DB 锁等待/索引退化）还是 `esService.bulkIndex` 变慢（ES refresh 间隔被调大或磁盘 IO 打满）。
+2. 看评价池用的 HikariCP 连接池 `active_connections` 是否顶在 `maximumPoolSize`——如果是，说明是 DB 连接不够，任务都在等连接。
+3. 看是否有大对象——某次评价带 9 张图，图片处理（压缩/审核）卡在 IO，把单个任务从 50ms 拉到 2s。
+
+### 第四层：方案权衡
+
+**Q：评价池队列满了用 CallerRunsPolicy 反压，但 Tomcat 线程被占用会导致整个服务响应变慢。你怎么权衡？**
+
+CallerRunsPolicy 是"用应用自身线程兜底"，确实会反伤 Tomcat。权衡方案分层：
+1. 先量化——CallerRuns 触发率（`rejected / submitted`）如果只有 0.1%，影响可忽略；如果到 5%，必须处理。
+2. 短期——把评价池 `maximumPoolSize` 从 200 扩到 400，或队列从 5000 扩到 10000，给突发流量缓冲。
+3. 中期——评价写入本来就是非核心链路（用户提交后可异步），改用 `DiscardOldest` + Kafka 兜底：丢弃队列最老的任务但写一条 Kafka，下游补偿重试。
+4. 根本——评价写入改全异步（用户提交即返回，写 Kafka，消费者落库），彻底解耦 Tomcat 线程。
+
+### 第五层：验证与沉淀
+
+**Q：你把评价池从 core=50 扩到 core=100，怎么证明扩容有效而不是流量自然回落？**
+
+上线前采 1 周基线（`active_threads`、`queue_size`、`rejected_count`、评价提交 P99），上线后采 1 周。关键看两个归一化指标：
+1. `queue_size / qps`（单位请求的排队深度）——如果显著下降，说明扩容有效。
+2. 评价提交 P99 在相同 QPS 分位下的对比——按 QPS 分桶（如 1000/2000/3000 QPS）对比 P99，消除流量波动。
+沉淀：把线程池七参数 + 拒绝数告警阈值（`rejected_count > 100/min` 告警）写入团队 JVM/线程池模板，Code Review 强制检查所有 `ThreadPoolExecutor` 必须命名 + 暴露监控指标。

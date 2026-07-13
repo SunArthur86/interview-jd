@@ -188,3 +188,49 @@ IO 模型本质是**"用多路复用让少量线程处理大量连接"**——BI
 1. **select/poll/epoll 区别**？——select 1024 限制/遍历；poll 无限制/遍历；epoll 事件驱动 O(1)。
 2. **Netty 怎么避免内存泄漏**？——ByteBuf 引用计数+池化+泄漏检测（PARANOID 级别）。
 3. **WebSocket 和 HTTP 长轮询区别**？——WebSocket 全双工一次握手；长轮询是 HTTP 反复请求。
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：直播弹幕网关你用 Netty（NIO）而不是 Tomcat（BIO/NIO），Netty 到底强在哪？Tomcat 也能扛高并发啊。**
+
+Tomcat 8+ 也用 NIO（NioEndpoint），理论也能扛几万连接。但 Tomcat 是为"请求-响应"模型设计的（HTTP 短连接），每个请求一个线程处理（线程池），连接处理完释放。直播弹幕是"长连接 + 主动推送"——百万观众建立 WebSocket 后一直保持，服务器要随时 push 弹幕，且连接多但每个连接的活跃度低（大部分时间空闲）。Tomcat 的线程模型（连接绑定线程）会浪费百万线程（不可能），而 Netty 的 Reactor 模型是"少量 EventLoop 线程管理大量连接"（1 个 EventLoop 管几千 Channel），EventLoop 通过 epoll 事件通知处理就绪的连接，空闲连接不占线程。Netty 还内置了 WebSocket 协议支持、ByteBuf 池化、零拷贝，专为长连接高并发优化。本质差异：Tomcat 是"同步请求-响应"，Netty 是"异步事件驱动"。
+
+### 第二层：证据与定位
+
+**Q：直播网关单机支撑 50 万连接的承诺，实际压测只到 10 万就 OOM 了。你怎么定位是 Netty 配置问题还是系统参数？**
+
+OOM 在连接数场景常见根因：
+1. **文件句柄**——`ulimit -n` 默认 1024，10 万连接就 `Too many open files`。查 `lsof -p <pid> | wc -l` 看实际句柄数，调 `/etc/security/limits.conf` 到 1100000。
+2. **Direct 内存**——Netty 默认用 DirectByteBuf（堆外内存），每个连接的接收缓冲区（默认 4KB-64KB）× 50 万 = 几 GB 堆外。查 `-XX:MaxDirectMemorySize` 和 `top` 的 RES。调 `ChannelOption.ALLOCATOR` 用 pooled + 小 buffer。
+3. **堆内存**——每个 Channel 的 handler 链（编解码器、业务 handler）占堆内存，50 万连接 × 每连接几 KB = 几 GB。查 `jmap -histo` 看对象数，优化 handler 无状态化。
+4. **TCP 参数**——`net.ipv4.ip_local_port_range`（端口范围）、`net.ipv4.tcp_tw_reuse`（TIME_WAIT 复用）、`net.core.somaxconn`（连接队列）都要调。
+
+### 第三层：根因深挖
+
+**Q：弹幕推送出现"半包"——客户端收到的弹幕 JSON 不完整解析失败。根因是什么？怎么根治？**
+
+TCP 是"流"协议，没有消息边界，发送方 write 两次（弹幕 A + 弹幕 B），接收方可能一次 read 收到"弹幕A的前半 + 弹幕B"（粘包）或"弹幕A的后半"（半包）。根因是应用层没定义消息边界。根治靠解码器：
+1. **LengthFieldBasedFrameDecoder**——消息头 4 字节存长度，解码器按长度切分。最通用，推荐。
+2. **LineBasedFrameDecoder**——按换行符切，适合文本协议（如弹幕用 \n 分隔）。
+3. **DelimiterBasedFrameDecoder**——按自定义分隔符。
+关键是要在"协议设计"阶段就定边界（消息头含长度字段），不能依赖 TCP 的 write/read 次数对应（这是最常见的误解）。Netty pipeline 里解码器必须在业务 handler 前面，且解码后传给业务的是完整的消息对象。
+
+### 第四层：方案权衡
+
+**Q：Netty 你用主从 Reactor（Boss + Worker），但有些场景用单线程 Reactor（如 Redis）。什么时候该用主从，什么时候单线程够？**
+
+单线程 Reactor（1 个线程管所有连接 + IO + 业务）适合"业务极快"的场景——Redis 的命令都是内存操作微秒级，单线程够且避免锁。直播弹幕网关业务慢（弹幕要风控审核、敏感词匹配、Kafka 投递），单线程会让 EventLoop 阻塞，其他连接的事件处理被拖延。主从 Reactor 的 Boss 负责接连接（accept，快），Worker 负责 IO（read/write，中），业务用独立线程池（慢业务不阻塞 IO 线程）。权衡维度是"业务耗时"——业务 <1ms 用单线程，1-100ms 用主从 + 业务线程池，>100ms（如调外部服务）必须异步化（CompletableFuture/回调）否则线程池也撑不住。直播网关是主从 + 业务线程池 + 弹幕异步投 Kafka。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么验证直播网关在 50 万连接下，弹幕推送的 P99 延迟符合 SLA（<200ms）？**
+
+高并发长连接的验证靠专业压测：
+1. 压测工具——wrk 不支持 WebSocket，用专用工具（Gatling/JMeter WebSocket 插件/自研 Netty 客户端）模拟 50 万长连接，每个连接每秒发 1 条弹幕 + 接收推送。
+2. 延迟埋点——弹幕带 `sendTime`，网关收到后对比 `now - sendTime`（上行延迟）；推送时带 `pushTime`，客户端收到后对比（端到端延迟）。P99 应 <200ms（上行 <50ms + 处理 <100ms + 下行 <50ms）。
+3. 稳定性——压测持续 30 分钟，看连接数是否稳定（不断连）、EventLoop 队列是否堆积、Full GC 频率。
+沉淀：Netty 参数模板（Boss/Worker 线程数、ByteBuf 池、IdleStateHandler 心跳）；连接数监控告警（单机 >45 万预警）；Direct 内存监控（`-Dio.netty.leakDetection.level=PARANOID` 测试环境查泄漏）。

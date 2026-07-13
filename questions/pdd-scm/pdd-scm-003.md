@@ -157,3 +157,68 @@ DDD 本质是**"用业务语言驱动技术建模"**：
 1. **聚合和聚合根区别**？——聚合是一组相关对象（一致性边界），聚合根是聚合的入口实体。
 2. **DDD 一定比三层架构好吗**？——不是。简单 CRUD 用 DDD 过度设计；复杂业务领域才值得。
 3. **领域事件怎么保证不丢**？——本地消息表（业务+事件同事务）+ MQ + 消费幂等。
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：拼多多供应链已经有商品/库存/订单三套独立的微服务，为什么还要用 DDD 重新建模？现有的三层架构 + RPC 调用哪里出了问题？**
+
+出在"概念穿透"和"逻辑散落"。现有系统的问题：订单服务里 `OrderService.create()` 直接写了库存校验逻辑（`if (stock < qty) throw`），因为业务方图省事把库存判断 copy 进来。结果是库存规则改了（比如加上"预售允许超卖"），订单服务也得改，耦合扩散。DDD 的动机是用限界上下文划死边界——库存规则只能在库存上下文里，订单只能通过 `StockReservedEvent` 感知结果，物理隔离业务逻辑的蔓延。
+
+### 第二层：证据与定位
+
+**Q：你怎么判断"订单服务里偷偷写了库存逻辑"这种越界？代码 review 能发现吗？**
+
+Code Review 不够，要靠架构守护工具：
+1. **ArchUnit** 写测试规则——`classes().that().resideInAPackage("..order..").should().onlyDependOnClassesThat().resideInAnyPackage("..order..", "..event..")`，订单包不能直接 import 库存包的类，跑单测就 fail。
+2. **依赖矩阵扫描**——用 `jqassistant` 或 Structure101 扫描，看 `com.pdd.order` 是否有对 `com.pdd.stock.service.StockService` 的直接依赖，画出依赖图，发现违规连线。
+3. **领域语言对齐检查**——在订单服务的代码里 grep `stock` 关键字，如果出现 `stockDao`/`stockService` 直接调用，就是越界证据。
+
+### 第三层：根因深挖
+
+**Q：你用聚合根把订单的一致性边界划好了，但下单扣库存这个跨聚合操作，事务怎么保证？订单创建成功但库存扣减失败怎么办？**
+
+不能用本地事务（跨服务跨库）。用 Saga 模式 + 本地消息表。具体流程：
+1. 订单聚合 `create()` 时，同事务写 `order` 表 + `outbox` 表（`OrderCreatedEvent`），本地事务保证订单和事件原子。
+2. 定时任务扫 outbox 投递 Kafka，库存服务消费 `OrderCreatedEvent` 调 `stock.deduct()`。
+3. 如果库存不足扣减失败，库存服务发 `StockDeductFailedEvent`，订单服务消费后做补偿——`order.compensate()` 把订单状态回滚到 `CANCELLED`，并发 `OrderCancelledEvent`。根因解决靠的是"事件驱动 + 补偿事务"，不是分布式锁或 XA。
+
+**Q：那为什么不直接用 TCC？Try-Confirm-Cancel 不是更严格吗？**
+
+TCC 更严格（每个服务实现 Try/Confirm/Cancel 三个接口，Try 阶段就预扣资源），但有代价：
+1. **业务侵入重**——库存服务要拆成 `tryDeduct`（冻结）、`confirmDeduct`（确认）、`cancelDeduct`（解冻），每个业务动作都要写三遍。
+2. **不适合长流程**——拼多多下单到支付可能间隔几十分钟（用户犹豫），TCC 的 Try 资源冻结这么久会严重影响库存可用性。
+3. **Saga 更适合**——订单先创建（不冻结库存），支付时才扣减，失败就补偿取消订单。只有"强资源锁定"场景（如机票座位）才用 TCC。供应链下单用 Saga 是因为库存可以短暂超卖（用户支付前），补偿成本低。
+
+### 第四层：方案权衡
+
+**Q：你用本地消息表 + Kafka 保证事件不丢，但如果 Kafka 消费者处理 `OrderCreatedEvent` 时宕机，重启后怎么保证幂等不重复扣库存？**
+
+靠幂等键 + 状态机。库存扣减的幂等设计：
+1. **幂等键**：`deduct_id = orderId + skuId`（事件携带），库存表有唯一索引 `(orderId, skuId)`，重复消费时 INSERT 冲突直接忽略。
+2. **状态机校验**：库存扣减记录有状态 `INIT → DEDUCTED → RELEASED`，消费时先 `SELECT ... WHERE order_id=? AND status='INIT'`，只有 INIT 状态才扣，重复消费发现已是 `DEDUCTED` 直接 return。
+3. **Redis 去重前置**：消费前 `SETNX order:{orderId}:deducted 1 EX 86400`，已存在就跳过，挡住 Kafka 至少一次的重复投递。
+
+**Q：为什么不直接用 Kafka 的 exactly-once 语义？**
+
+Kafka 的 EOS（`exactly.once.v2=true`）只保证"消费-处理-生产"链路的精确一次（用事务把 offset 提交和下游生产绑定）。但库存扣减是"消费 Kafka + 写 MySQL"，跨 Kafka 和 MySQL 两个系统，Kafka 事务管不到 MySQL。所以业务层必须自己做幂等（唯一键 + 状态机），EOS 只是减少重复投递，不能替代幂等设计。
+
+### 第五层：验证与沉淀
+
+**Q：你重构后，怎么证明限界上下文的边界真的守住了、没有新的越界代码混进来？**
+
+靠 ArchUnit 持续守护：
+1. **CI 集成**——ArchUnit 测试纳入 CI 流水线，任何 PR 引入越界依赖（订单 import 库存）直接 fail build。
+2. **依赖度量**——每周跑一次依赖扫描，看"跨上下文调用次数"指标，应该是 0 或仅通过 event 包。如果出现非 0，告警 review。
+3. **事件契约测试**——用 Pact 或 Spring Cloud Contract 做消费者驱动契约测试，订单发布的 `OrderCreatedEvent` schema 变更必须通过库存服务的契约测试，防止接口悄悄改动。
+
+**Q：DDD 重构后怎么让团队维护这套模型，而不是半年后又退化成大泥球？**
+
+三件事：
+1. **统一语言词典**——维护一份领域术语表（"商品=SPU，库存=可售现货+预售"，每个术语绑定上下文），代码命名必须用词典术语，PR review 对照。
+2. **聚合根守护规则**——Code Review checklist：聚合内的修改必须通过聚合根方法（`order.addItem()`），禁止直接 `orderItem.setQty()`；外部只持有 `orderId` 不持有 `Order` 引用。
+3. **建模工作坊**——每个迭代做一次事件风暴（Event Storming），业务方+研发一起贴便利贴梳理领域事件，让模型持续对齐业务变化，而不是一次性设计完就冻结。
+

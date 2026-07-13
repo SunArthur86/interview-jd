@@ -199,3 +199,58 @@ map.put(uid, merge(old, delta));
 // ✅ 原子的 compute
 map.compute(uid, (k, old) -> merge(old, delta));
 ```
+
+## 苏格拉底式面试追问
+
+> 这组追问不是背答案，而是模拟面试官层层逼近本质。每一问先回答"为什么"，再回答"怎么做"，最后回答"如何证明"。
+
+### 第一层：目标与动机
+
+**Q：风控的实时特征缓存你用 ConcurrentHashMap 存 userId → UserRiskProfile，为什么不直接用 Redis？CHM 的本地缓存和 Redis 分布式缓存的选型依据是什么？**
+
+实时风控决策链路 RT 预算 200ms，其中留给特征查询只有 30ms。Redis 单次 get 走网络 1-3ms（P99 可能 10ms+），一个决策要查几十个特征键，即使 pipeline 也要 5-10ms，且 Redis 抖动（主从切换、慢查询）会把 P99 拉到 50ms。CHM 是本地内存纳秒级访问，且 UserRiskProfile 是 Kafka 实时流订阅合并写入，读多写多但单机自治。决策依据不是"哪个好"，是 SLA——本地缓存 P99 <0.1ms，Redis P99 10ms，差 100 倍。所以我们用 CHM 做一级（毫秒以下），Redis 做二级兜底（CHM 未命中或冷启动时回源）。
+
+### 第二层：证据与定位
+
+**Q：风控服务 CPU 飙到 95%，但 QPS 没涨，你怎么确认是 CHM 的桶锁竞争还是别的？**
+
+三组证据定位：
+1. `arthas thread -n 5` 看最忙的 5 个线程——如果栈顶停在 `java.util.concurrent.ConcurrentHashMap.putVal` 且状态是 BLOCKED，且多个线程都在等同一个对象 monitor（`- parking to wait for <0x...>` 后面的地址相同），是桶锁竞争。
+2. `jstack <pid> | grep -B1 "ConcurrentHashMap" | grep BLOCKED | wc -l`——统计阻塞在 CHM 的线程数，如果占比 >20%，锁定。
+3. `arthas dashboard` 看 CPU 占比最高的方法——如果 `putVal` 或 `compute` 在火焰图里占比 >30%，确认是 CHM 写热点。进一步用 `arthas watch com.xxx.FeatureCache merge '{params, returnObj}' '#cost > 1'` 看是哪个 key 被疯狂写入。
+
+### 第三层：根因深挖
+
+**Q：你定位到是某个 key（比如 userId="SHARED_IP_LIST"）的桶锁竞争，几万 QPS 都在写同一个 key。根因是什么？为什么单 key 会这么热？**
+
+根因是"共享热点 key"——所有用户的请求都去更新一个全局的"高风险 IP 列表"特征，几万 QPS 撞到 CHM 的同一个桶（hash 冲突到同一个 Node），synchronized 桶锁变成事实上的全局锁。这不是 CHM 的问题，是数据建模问题——把"用户维度"的特征和"全局维度"的特征混在一张 CHM 里，全局 key 天生是热点。验证方法：dump 一下 CHM 的 key 分布，`arthas ognl '@com.xxx.FeatureCache@profileCache.keySet().stream().collect(...)'` 看哪些 key 的写入频率异常（用 CounterCell 思路分桶计数）。
+
+**Q：根因是热点 key，那为什么不直接把 CHM 换成 Caffeine（更高性能的本地缓存）？**
+
+换 Caffeine 治不了病。Caffeine 用的是 W-TinyLFU 算法 + 异步维护，读路径确实更快，但写热点 key 时它的底层也是 ConcurrentHashMap，写同一个 key 一样要锁。工具换不动架构问题。正确做法是拆热点——把一个全局的 SHARED_IP_LIST key 拆成 N 个分片（SHARED_IP_LIST_0 到 SHARED_IP_LIST_15），写入时按 hash 分到不同桶，读取时合并 N 个分片。这样单 key 的 QPS 从几万降到几千，分散到 16 个桶，桶锁竞争消失。
+
+### 第四层：方案权衡
+
+**Q：你拆了 16 个分片后桶锁竞争降了，但读时要合并 16 个分片（RT 增加），怎么权衡？**
+
+先量化代价。16 个分片读 CHM，单次 get 纳秒级，16 次也就几微秒，相比整个决策链路 30ms 的特征预算可忽略。真正要权衡的是"分片数 N"：N 太小（如 2）竞争还在，N 太大（如 256）内存浪费且合并成本上升。我们按"写入 QPS / 单桶安全 QPS"算——实测单桶 synchronized 在 5000 QPS 内 RT 不受影响，热点 key 写入 50000 QPS，所以 N = 50000/5000 = 10，取 16（2 的幂方便位运算分片）。合并读用 `Stream`/并行或直接 16 次顺序 get，P99 增加 <0.1ms，可接受。
+
+**Q：为什么不直接用 LongAdder 那种 Cell 思路，把热点 key 的 value 内部做分片，而不是 key 分片？**
+
+因为 value 不是计数器。LongAdder 分片有效是因为它的语义是"累加"，最终 sum 即可。但 UserRiskProfile 是一个复杂对象（IP 列表、设备列表、交易历史），不是可交换的数值，"分片后再合并"语义上要定义 merge 逻辑且不保证强一致（分片间可能读到不同时刻的值）。key 分片则每个分片是完整独立的 value，读时合并 16 个独立快照语义清晰。对于纯计数场景（如请求计数）我们确实用 LongAdder，但结构化数据用 key 分片。
+
+### 第五层：验证与沉淀
+
+**Q：你怎么证明热点 key 拆分后桶锁竞争真的消除，CPU 真的降了？**
+
+上线前后双指标对比：
+1. CPU 对比——Prometheus 拉 `process_cpu_usage`，分片前 P95=95%、分片后 P95=60%，且 QPS 没变（用 `feature_query_qps` 归一化），CPU/QPS 比值下降 35%，证明是竞争减少省下的 CPU（不是流量降）。
+2. 锁等待对比——arthas 在峰值时段 `profiler start` 采样 60 秒，`profiler stop --format flame` 生成火焰图，对比分片前后 `putVal → synchronized` 的 CPU 采样占比（从 35% 降到 3%），直接看到锁等待消失。同时 `arthas thread --state BLOCKED` 看 BLOCKED 线程数峰值从 50 降到 2。
+
+**Q：怎么让团队以后不再把全局热点 key 塞进 CHM？**
+
+沉淀成机制：
+1. Code Review 规则——所有 CHM 的 key 必须是"实体维度"（userId、deviceId、orderId），全局/共享维度的 key 必须用独立的单线程更新结构（如 AtomicReference + 定时刷新），不能进高并发 CHM。
+2. 静态扫描——写一个 SpotBugs 插件，扫描 `@SharedGlobal` 注解的字段是否被用作 CHM 的 key，命中即告警。
+3. 运行时监控——给 CHM 加一个 wrapper，统计每个 key 的 put 频率（用 sampled counter，只采 1% 避免性能损耗），任何 key 的 QPS > 全表平均 QPS 的 10 倍即告警"疑似热点 key"。
+4. 故障复盘——把这次"SHARED_IP_LIST 单 key 几万 QPS → 桶锁竞争 → CPU 95%"的火焰图和 arthas 截图存入知识库，作为"数据建模要区分实体维度和全局维度"的典型案例。
